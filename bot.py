@@ -1,18 +1,25 @@
 """
 Бот очереди выносов для клуба «Кики».
 
+Главное отличие от первой версии: бот ведёт ОДНО сообщение с очередью на
+чат, которое сам редактирует при любом изменении, вместо того чтобы
+присылать отдельную карточку на каждую заявку. Это сообщение бот старается
+закрепить (если у него есть права администратора в группе) — так очередь
+всегда под рукой, а не теряется среди сотен сообщений.
+
 Логика:
-- Любой участник группы может подать заявку через /new (мастер из нескольких шагов).
-- Заявка появляется в группе одной карточкой со статусом «Собираются».
-- Кнопка «Готовы» под карточкой — бригада жмёт сама, когда реально готова.
-  После этого статус меняется на «Готовы», и время готовности используется
-  для очерёдности (а не время подачи заявки).
+- Любой участник группы подаёт заявку через /new (мастер из нескольких шагов).
+- Заявка добавляется в общий список со статусом «Собираются», и сразу же
+  обновляется единое сообщение-очередь.
+- Кнопка «Готовы» под нужной заявкой в этом сообщении — бригада жмёт сама,
+  когда реально готова. Время готовности используется для очерёдности
+  (а не время подачи заявки).
 - VIP-заявки всегда идут выше остальных, независимо от времени.
-- Кнопка «Объявить» доступна только когда заявка «Готовы» и очередь не на паузе.
+- Кнопка «Объявить» доступна только когда заявка «Готовы» и очередь не на
+  паузе.
 - Менеджер командой /pause ставит очередь на паузу (например, начался номер
-  шоу-программы), /resume — снимает. Пока пауза активна, кнопка «Объявить»
-  заблокирована для всех заявок.
-- Если в заявке указан заказ песни — карточка автоматически тегает MC и
+  шоу-программы), /resume — снимает.
+- Если в заявке указан заказ песни — в очереди она помечается тегами MC и
   ответственного за музыку (юзернеймы задаются в конфиге ниже).
 
 Хранение — в памяти процесса (для теста). Для продакшена стоит заменить
@@ -28,7 +35,8 @@ from typing import Optional
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandObject
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -45,13 +53,9 @@ from aiogram.types import (
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "PASTE_YOUR_TOKEN_HERE")
 
-# Юзернеймы (без @), которых тегать при заказе песни
 MC_USERNAME = os.environ.get("MC_USERNAME", "MC_username")
 MUSIC_USERNAME = os.environ.get("MUSIC_USERNAME", "music_username")
 
-# Кто может ставить паузу (менеджеры). Укажи Telegram user_id через запятую
-# в переменной окружения MANAGER_IDS, например: "123456789,987654321"
-# Если оставить пустым — паузу сможет ставить кто угодно (проще для теста).
 MANAGER_IDS = {
     int(x) for x in os.environ.get("MANAGER_IDS", "").split(",") if x.strip()
 }
@@ -60,7 +64,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("kiki-bot")
 
 # ---------------------------------------------------------------------------
-# СОСТОЯНИЕ (в памяти, на группу/чат)
+# СОСТОЯНИЕ (в памяти, на чат)
 # ---------------------------------------------------------------------------
 
 
@@ -74,7 +78,6 @@ class Order:
     status: str = "collecting"  # collecting -> ready -> announced -> done
     created_at: datetime = field(default_factory=datetime.now)
     ready_at: Optional[datetime] = None
-    author_name: str = ""
 
 
 class ChatState:
@@ -82,31 +85,25 @@ class ChatState:
         self.orders: dict[int, Order] = {}
         self.next_id = 1
         self.paused = False
+        self.queue_message_id: Optional[int] = None
 
-    def add_order(self, table: str, kind: str, vip: bool, song: Optional[str], author_name: str) -> Order:
-        order = Order(
-            id=self.next_id,
-            table=table,
-            kind=kind,
-            vip=vip,
-            song=song,
-            author_name=author_name,
-        )
+    def add_order(self, table: str, kind: str, vip: bool, song: Optional[str]) -> Order:
+        order = Order(id=self.next_id, table=table, kind=kind, vip=vip, song=song)
         self.orders[order.id] = order
         self.next_id += 1
         return order
 
-    def sorted_active(self) -> list[Order]:
-        active = [o for o in self.orders.values() if o.status not in ("done",)]
+    def visible_orders(self) -> list[Order]:
+        active = [o for o in self.orders.values() if o.status != "done"]
 
         def sort_key(o: Order):
             ref_time = o.ready_at or o.created_at
-            return (0 if o.vip else 1, ref_time)
+            stage_rank = {"collecting": 1, "ready": 0, "announced": 2}[o.status]
+            return (stage_rank, 0 if o.vip else 1, ref_time)
 
         return sorted(active, key=sort_key)
 
 
-# chat_id -> ChatState
 chat_states: dict[int, ChatState] = {}
 
 
@@ -157,7 +154,8 @@ def yes_no_keyboard(prefix: str) -> InlineKeyboardMarkup:
 @router.message(Command("new"))
 async def cmd_new(message: Message, state: FSMContext) -> None:
     await state.set_state(NewOrder.choosing_kind)
-    await message.reply("Кто подаёт заявку?", reply_markup=kind_keyboard())
+    wizard_msg = await message.reply("Кто подаёт заявку?", reply_markup=kind_keyboard())
+    await state.update_data(wizard_message_id=wizard_msg.message_id)
 
 
 @router.callback_query(NewOrder.choosing_kind, F.data.startswith("kind:"))
@@ -174,7 +172,9 @@ async def enter_table(message: Message, state: FSMContext) -> None:
     table = message.text.strip()
     await state.update_data(table=table)
     await state.set_state(NewOrder.asking_vip)
-    await message.reply("Это VIP-стол?", reply_markup=yes_no_keyboard("vip"))
+    wizard_msg = await message.reply("Это VIP-стол?", reply_markup=yes_no_keyboard("vip"))
+    await state.update_data(wizard_message_id=wizard_msg.message_id)
+    await try_delete(message)
 
 
 @router.callback_query(NewOrder.asking_vip, F.data.startswith("vip:"))
@@ -196,79 +196,137 @@ async def ask_song(callback: CallbackQuery, state: FSMContext) -> None:
         return
 
     await state.update_data(song=None)
-    await finalize_order(callback.message, state, callback.from_user.full_name)
+    await finalize_order(callback.message, state)
     await callback.answer()
 
 
 @router.message(NewOrder.entering_song_name)
 async def enter_song_name(message: Message, state: FSMContext) -> None:
     await state.update_data(song=message.text.strip())
-    await finalize_order(message, state, message.from_user.full_name)
+    await finalize_order(message, state)
+    await try_delete(message)
 
 
-async def finalize_order(message: Message, state: FSMContext, author_name: str) -> None:
+async def try_delete(message: Message) -> None:
+    try:
+        await message.delete()
+    except TelegramBadRequest:
+        pass
+
+
+async def finalize_order(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    chat_state = get_state(message.chat.id)
-    order = chat_state.add_order(
+    chat_id = message.chat.id
+    chat_state = get_state(chat_id)
+    chat_state.add_order(
         table=data["table"],
         kind=data["kind"],
         vip=data.get("vip", False),
         song=data.get("song"),
-        author_name=author_name,
     )
+
+    wizard_message_id = data.get("wizard_message_id")
     await state.clear()
-    await post_order_card(message.bot, message.chat.id, order)
+
+    bot = message.bot
+    if wizard_message_id:
+        try:
+            await bot.delete_message(chat_id, wizard_message_id)
+        except TelegramBadRequest:
+            pass
+
+    await refresh_queue_message(bot, chat_id)
 
 
 # ---------------------------------------------------------------------------
-# Карточка заявки в группе + кнопки действий
+# Единое сообщение очереди — рендер и обновление
 # ---------------------------------------------------------------------------
 
 
-def render_card_text(order: Order, paused: bool) -> str:
-    kind_label = "Вынос" if order.kind == "waiter" else "Кальян"
-    lines = [f"<b>Стол {order.table}</b> — {kind_label}"]
-    if order.vip:
-        lines.append("⭐ <b>VIP</b>")
-    status_map = {
-        "collecting": "🟡 Собираются",
-        "ready": "🟢 Готовы, ждут объявления",
-        "announced": "🟣 Объявлено",
-        "done": "✅ Выполнено",
-    }
-    lines.append(status_map[order.status])
-    if order.song:
-        lines.append(f"🎵 Заказ песни: {order.song}")
-        lines.append(f"cc: @{MC_USERNAME} @{MUSIC_USERNAME}")
-    if paused and order.status == "ready":
-        lines.append("⏸ <i>Очередь на паузе — идёт номер</i>")
+STATUS_EMOJI = {"collecting": "🟡", "ready": "🟢", "announced": "🟣"}
+STATUS_LABEL = {
+    "collecting": "Собираются",
+    "ready": "Готовы, ждут объявления",
+    "announced": "Объявлено",
+}
+
+
+def render_queue_text(chat_state: ChatState) -> str:
+    orders = chat_state.visible_orders()
+    lines = ["<b>📋 Очередь выносов</b>"]
+    if chat_state.paused:
+        lines.append("⏸ <b>Пауза — сейчас идёт номер</b>")
+    lines.append("")
+
+    if not orders:
+        lines.append("Очередь пуста.")
+    else:
+        for i, o in enumerate(orders, start=1):
+            kind_label = "Вынос" if o.kind == "waiter" else "Кальян"
+            mark = "⭐" if o.vip else str(i)
+            lines.append(f"{mark}. Стол {o.table} — {kind_label} {STATUS_EMOJI[o.status]} {STATUS_LABEL[o.status]}")
+            if o.song:
+                lines.append(f"    🎵 {o.song} — cc: @{MC_USERNAME} @{MUSIC_USERNAME}")
+
+    lines.append("")
+    lines.append("<i>/new — новая заявка · /pause /resume — управление менеджера</i>")
     return "\n".join(lines)
 
 
-def render_card_keyboard(order: Order, paused: bool) -> InlineKeyboardMarkup:
-    buttons = []
-    if order.status == "collecting":
-        buttons.append(InlineKeyboardButton(text="✅ Готовы", callback_data=f"ready:{order.id}"))
-    elif order.status == "ready":
-        announce_btn = InlineKeyboardButton(
-            text="📣 Объявить" if not paused else "⏸ На паузе",
-            callback_data=f"announce:{order.id}",
-        )
-        buttons.append(announce_btn)
-    elif order.status == "announced":
-        buttons.append(InlineKeyboardButton(text="🏁 Выполнено", callback_data=f"done:{order.id}"))
+def render_queue_keyboard(chat_state: ChatState) -> InlineKeyboardMarkup:
+    orders = chat_state.visible_orders()
+    rows = []
+    for o in orders:
+        kind_label = "Вынос" if o.kind == "waiter" else "Кальян"
+        label = f"Стол {o.table} ({kind_label})"
+        if o.status == "collecting":
+            rows.append([InlineKeyboardButton(text=f"✅ Готовы — {label}", callback_data=f"ready:{o.id}")])
+        elif o.status == "ready":
+            text = "⏸ На паузе" if chat_state.paused else f"📣 Объявить — {label}"
+            rows.append([InlineKeyboardButton(text=text, callback_data=f"announce:{o.id}")])
+        elif o.status == "announced":
+            rows.append([InlineKeyboardButton(text=f"🏁 Выполнено — {label}", callback_data=f"done:{o.id}")])
+        rows.append([InlineKeyboardButton(text=f"✕ Отменить — {label}", callback_data=f"cancel:{o.id}")])
 
-    if order.status != "done":
-        buttons.append(InlineKeyboardButton(text="✕ Отменить", callback_data=f"cancel:{order.id}"))
-
-    return InlineKeyboardMarkup(inline_keyboard=[buttons] if buttons else [])
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else InlineKeyboardMarkup(inline_keyboard=[])
 
 
-async def post_order_card(bot: Bot, chat_id: int, order: Order) -> None:
+async def refresh_queue_message(bot: Bot, chat_id: int) -> None:
     chat_state = get_state(chat_id)
-    text = render_card_text(order, chat_state.paused)
-    kb = render_card_keyboard(order, chat_state.paused)
-    await bot.send_message(chat_id, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    text = render_queue_text(chat_state)
+    kb = render_queue_keyboard(chat_state)
+
+    if chat_state.queue_message_id is None:
+        msg = await bot.send_message(chat_id, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        chat_state.queue_message_id = msg.message_id
+        try:
+            await bot.pin_chat_message(chat_id, msg.message_id, disable_notification=True)
+        except TelegramBadRequest:
+            logger.warning("Не удалось закрепить сообщение очереди в чате %s", chat_id)
+        return
+
+    try:
+        await bot.edit_message_text(
+            text,
+            chat_id=chat_id,
+            message_id=chat_state.queue_message_id,
+            reply_markup=kb,
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            return
+        msg = await bot.send_message(chat_id, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        chat_state.queue_message_id = msg.message_id
+        try:
+            await bot.pin_chat_message(chat_id, msg.message_id, disable_notification=True)
+        except TelegramBadRequest:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Действия по заявкам
+# ---------------------------------------------------------------------------
 
 
 @router.callback_query(F.data.startswith("ready:"))
@@ -281,11 +339,7 @@ async def on_ready(callback: CallbackQuery) -> None:
         return
     order.status = "ready"
     order.ready_at = datetime.now()
-    await callback.message.edit_text(
-        render_card_text(order, chat_state.paused),
-        reply_markup=render_card_keyboard(order, chat_state.paused),
-        parse_mode=ParseMode.HTML,
-    )
+    await refresh_queue_message(callback.bot, callback.message.chat.id)
     await callback.answer("Отмечено: готовы")
 
 
@@ -301,11 +355,7 @@ async def on_announce(callback: CallbackQuery) -> None:
         await callback.answer("Очередь на паузе — сейчас идёт номер", show_alert=True)
         return
     order.status = "announced"
-    await callback.message.edit_text(
-        render_card_text(order, chat_state.paused),
-        reply_markup=render_card_keyboard(order, chat_state.paused),
-        parse_mode=ParseMode.HTML,
-    )
+    await refresh_queue_message(callback.bot, callback.message.chat.id)
     await callback.answer("Объявлено")
 
 
@@ -318,11 +368,7 @@ async def on_done(callback: CallbackQuery) -> None:
         await callback.answer("Заявка не найдена", show_alert=True)
         return
     order.status = "done"
-    await callback.message.edit_text(
-        render_card_text(order, chat_state.paused),
-        reply_markup=render_card_keyboard(order, chat_state.paused),
-        parse_mode=ParseMode.HTML,
-    )
+    await refresh_queue_message(callback.bot, callback.message.chat.id)
     await callback.answer("Готово")
 
 
@@ -332,18 +378,18 @@ async def on_cancel(callback: CallbackQuery) -> None:
     chat_state = get_state(callback.message.chat.id)
     if order_id in chat_state.orders:
         del chat_state.orders[order_id]
-    await callback.message.edit_text("❌ Заявка отменена")
+    await refresh_queue_message(callback.bot, callback.message.chat.id)
     await callback.answer("Отменено")
 
 
 # ---------------------------------------------------------------------------
-# Менеджерские команды: пауза очереди на время шоу-номера
+# Менеджерские команды
 # ---------------------------------------------------------------------------
 
 
 def is_manager(user_id: int) -> bool:
     if not MANAGER_IDS:
-        return True  # ограничение выключено — для простоты теста
+        return True
     return user_id in MANAGER_IDS
 
 
@@ -354,7 +400,8 @@ async def cmd_pause(message: Message) -> None:
         return
     chat_state = get_state(message.chat.id)
     chat_state.paused = True
-    await message.reply("⏸ Очередь на паузе. Объявления заблокированы до /resume.")
+    await refresh_queue_message(message.bot, message.chat.id)
+    await try_delete(message)
 
 
 @router.message(Command("resume"))
@@ -364,22 +411,14 @@ async def cmd_resume(message: Message) -> None:
         return
     chat_state = get_state(message.chat.id)
     chat_state.paused = False
-    await message.reply("▶ Очередь возобновлена.")
+    await refresh_queue_message(message.bot, message.chat.id)
+    await try_delete(message)
 
 
 @router.message(Command("queue"))
 async def cmd_queue(message: Message) -> None:
-    chat_state = get_state(message.chat.id)
-    active = chat_state.sorted_active()
-    if not active:
-        await message.reply("Очередь пуста.")
-        return
-    lines = ["<b>Текущая очередь:</b>"]
-    for i, order in enumerate(active, start=1):
-        mark = "⭐" if order.vip else str(i)
-        kind_label = "Вынос" if order.kind == "waiter" else "Кальян"
-        lines.append(f"{mark}. Стол {order.table} — {kind_label} — {order.status}")
-    await message.reply("\n".join(lines), parse_mode=ParseMode.HTML)
+    await refresh_queue_message(message.bot, message.chat.id)
+    await try_delete(message)
 
 
 @router.message(Command("start", "help"))
@@ -387,9 +426,12 @@ async def cmd_help(message: Message) -> None:
     await message.reply(
         "Команды:\n"
         "/new — подать заявку на вынос/кальян\n"
-        "/queue — посмотреть текущую очередь\n"
+        "/queue — показать/поднять сообщение с очередью\n"
         "/pause — менеджер ставит очередь на паузу (идёт номер)\n"
-        "/resume — менеджер возобновляет очередь"
+        "/resume — менеджер возобновляет очередь\n\n"
+        "Очередь всегда живёт в ОДНОМ сообщении, которое бот сам обновляет "
+        "и старается закрепить сверху чата — выдай боту права администратора "
+        "в группе, чтобы закрепление работало."
     )
 
 
