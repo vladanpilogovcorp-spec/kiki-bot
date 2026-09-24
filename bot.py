@@ -83,7 +83,7 @@ REGULAR_TABLES = [
 ALL_TABLES = VIP_TABLES + REGULAR_TABLES
 
 ALCOHOL_OPTIONS = ["Азуль", "Дон Периньон", "Дон Хулио", "Белуга 6л", "Кристалл"]
-HOOKAH_MENU = ["Классический", "Двойное яблоко", "Мохито", "Мультифрукт"]  # поправь под реальное меню
+HOOKAH_MENU = ["Кальян бутылка", "Кальян лакики бу", "Кальян Пайпай", "Кальян доби дог", "Кальян Арман 12 л", "Кальян флеш"]
 
 SHOW_SEGMENTS = ["Интро", "Трек / номер", "Поздравление ДР", "Другое"]
 
@@ -99,12 +99,24 @@ ROLE_LABELS = {
     "hookah": "Кальянщик",
     "hookah_chief": "Начальник кальянщиков",
     "mc": "MC",
+    "dancer": "Танцовщица",
+    "music": "Музыка (Натали)",
     "admin": "Админ",
 }
 
+# Коды для входа в роль — задаются на Railway переменной ROLE_CODES вида
+# "waiter=1111,hookah=2222,hookah_chief=2223,mc=3333,dancer=4444,music=5555,admin=9999"
+# Без этой переменной используются коды по умолчанию ниже (смени их!).
+_DEFAULT_ROLE_CODES = "waiter=1111,hookah=2222,hookah_chief=2223,mc=3333,dancer=4444,music=5555,admin=9999"
+ROLE_CODES: dict[str, str] = {}
+for pair in os.environ.get("ROLE_CODES", _DEFAULT_ROLE_CODES).split(","):
+    if "=" in pair:
+        role_key, code = pair.split("=", 1)
+        ROLE_CODES[code.strip()] = role_key.strip()
+
 user_roles: dict[int, str] = {}
-# по умолчанию первый, кто напишет /start и выберет "Админ", становится админом;
-# дальше админ может назначать роли другим через ADMIN_IDS или командой /setrole
+# по умолчанию первый, кто напишет /start и введёт код админа, становится
+# админом; дальше админ может назначать роли другим через /setrole
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
 
 
@@ -132,6 +144,7 @@ class Order:
     bday_variant: Optional[str] = None  # "text" | "alcohol" | "alcohol_track"
     alcohol: Optional[str] = None
     congrats_text: Optional[str] = None
+    announce_text: Optional[str] = None  # текст для МС в заявках кальянщика
     track: bool = False
     note_text: Optional[str] = None
     note_photo_id: Optional[str] = None
@@ -139,12 +152,19 @@ class Order:
     hookah_item: Optional[str] = None
     big_check: bool = False
 
+    no_waiter: bool = False  # заявка подана напрямую кальянщиком, без официанта
+    dancer: bool = False  # участвуют танцовщицы, нужно их подтверждение
+
     status: str = "collecting"  # collecting -> ready -> announced -> done
     ready_waiter: bool = False
     ready_hookah: bool = False
+    ready_track: bool = False
+    ready_mc: bool = False
+    ready_dancer: bool = False
 
     waiter_name: str = ""
     hookah_name: str = ""
+    music_name: str = ""
 
     created_at: datetime = field(default_factory=lambda: datetime.now(TIMEZONE))
     ready_at: Optional[datetime] = None
@@ -154,9 +174,20 @@ class Order:
     def needs_hookah_confirm(self) -> bool:
         return self.hookah
 
+    def needs_track_confirm(self) -> bool:
+        return self.track
+
     def is_fully_ready(self) -> bool:
-        if self.needs_hookah_confirm():
-            return self.ready_waiter and self.ready_hookah
+        if self.needs_hookah_confirm() and not self.ready_hookah:
+            return False
+        if self.needs_track_confirm() and not self.ready_track:
+            return False
+        if self.no_waiter:
+            if not self.ready_mc:
+                return False
+            if self.dancer and not self.ready_dancer:
+                return False
+            return True
         return self.ready_waiter
 
     def priority_score(self) -> tuple:
@@ -174,6 +205,9 @@ class ChatState:
         self.next_id = 1
         self.paused = False
         self.current_show: Optional[str] = None
+        self.show_program: list[dict] = []
+        self.current_show_index: Optional[int] = None
+        self.program_message_id: Optional[int] = None
         self.view_message_ids: dict[str, int] = {}
         self.done_archive: list[Order] = []  # для статистики за день
 
@@ -216,65 +250,79 @@ def role_keyboard(user_id: int) -> ReplyKeyboardMarkup:
 
     if role in ("waiter", "admin"):
         rows.append(["📋 Новая заявка"])
-        rows.append(["👤 Мои заявки"])
+        rows.append(["📋 Просмотреть заявки"])
     if role in ("hookah", "hookah_chief", "admin"):
+        rows.append(["📋 Новая заявка (свой вынос)"])
         rows.append(["💨 Заявки на кальян"])
     if role in ("hookah_chief", "admin"):
         rows.append(["👑 Контроль кальянщиков"])
     if role in ("mc", "admin"):
         rows.append(["🎤 Экран MC"])
+    if role in ("music", "admin"):
+        rows.append(["🎵 Треки"])
+    if role in ("dancer", "admin"):
+        rows.append(["💃 Мои выносы"])
+    if role in ("mc", "music", "dancer"):
+        rows.append(["🚻 Отошёл"])
     if role == "admin":
-        rows.append(["🧑‍💼 Менеджер", "🎬 Начать номер"])
-        rows.append(["📊 Статистика", "👥 Роли сотрудников"])
+        rows.append(["🧑‍💼 Менеджер", "🎬 Программа"])
+        rows.append(["📊 Статистика", "👀 Всё сразу"])
 
     if not rows:
         rows = [["ℹ️ Кто я?"]]
 
-    rows.append(["🔄 Сменить роль (тест)"])
+    rows.append(["🔄 Сменить роль"])
 
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=t) for t in row] for row in rows], resize_keyboard=True)
 
 
-def role_pick_keyboard() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text=label, callback_data=f"pickrole:{key}")] for key, label in ROLE_LABELS.items()]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+class RolePick(StatesGroup):
+    entering_code = State()
 
 
 @router.message(Command("start"))
-async def cmd_start(message: Message) -> None:
+async def cmd_start(message: Message, state: FSMContext) -> None:
     role = get_role(message.from_user.id)
     if role:
         await message.answer(f"Ты вошёл как: {ROLE_LABELS[role]}", reply_markup=role_keyboard(message.from_user.id))
     else:
-        await message.answer("Кто ты?", reply_markup=role_pick_keyboard())
+        await state.set_state(RolePick.entering_code)
+        await message.answer("Введи код своей роли (его даёт админ):")
 
 
-@router.callback_query(F.data.startswith("pickrole:"))
-async def on_pick_role(callback: CallbackQuery) -> None:
-    role = callback.data.split(":", 1)[1]
-    user_roles[callback.from_user.id] = role
-    await callback.message.edit_text(f"Готово, ты — {ROLE_LABELS[role]}")
-    await callback.bot.send_message(
-        callback.message.chat.id, "Меню обновлено 👇", reply_markup=role_keyboard(callback.from_user.id)
+@router.message(F.text == "🔄 Сменить роль")
+async def switch_role(message: Message, state: FSMContext) -> None:
+    await state.set_state(RolePick.entering_code)
+    await message.answer("Введи код роли, на которую хочешь переключиться:")
+
+
+@router.message(RolePick.entering_code)
+async def enter_role_code(message: Message, state: FSMContext) -> None:
+    code = message.text.strip()
+    role = ROLE_CODES.get(code)
+    await try_delete(message)
+    if not role:
+        await message.answer("Код не найден. Попробуй ещё раз или уточни у админа.")
+        return
+    user_roles[message.from_user.id] = role
+    await state.clear()
+    await message.answer(f"Готово, ты — {ROLE_LABELS[role]}", reply_markup=role_keyboard(message.from_user.id))
+
+
+@router.message(F.text == "🚻 Отошёл")
+async def btn_away(message: Message) -> None:
+    role = get_role(message.from_user.id)
+    if role not in ("mc", "music", "dancer"):
+        return
+    await message.answer(
+        f"⚠️ {ROLE_LABELS[role]} ({message.from_user.full_name}) ненадолго отошёл(-ла). "
+        f"Учтите задержку по своей части."
     )
-    await callback.answer()
 
 
 @router.message(F.text == "ℹ️ Кто я?")
 async def cmd_whoami_btn(message: Message) -> None:
     await message.reply("Роль ещё не назначена. Напиши /start.")
-
-
-@router.message(F.text == "🔄 Сменить роль (тест)")
-async def switch_role(message: Message) -> None:
-    if message.from_user.id in ADMIN_IDS:
-        await message.reply(
-            "Твой ID в ADMIN_IDS на Railway, поэтому роль всегда «Админ». "
-            "Чтобы протестировать другие роли этим же аккаунтом — временно убери "
-            "свой ID из переменной ADMIN_IDS."
-        )
-        return
-    await message.answer("Выбери роль для теста:", reply_markup=role_pick_keyboard())
 
 
 # ---------------------------------------------------------------------------
@@ -289,10 +337,11 @@ class NewOrder(StatesGroup):
     choosing_alcohol = State()
     entering_congrats = State()
     asking_track = State()
-    entering_note = State()
     asking_hookah = State()
     choosing_hookah_item = State()
     asking_big_check = State()
+    asking_note_yn = State()
+    entering_note = State()
     confirming = State()
 
 
@@ -357,6 +406,13 @@ async def start_new_order(message: Message, state: FSMContext) -> None:
     await state.clear()
     await state.set_state(NewOrder.choosing_table)
     await message.answer("Выбери стол:", reply_markup=tables_keyboard())
+
+
+@router.message(F.text == "📋 Новая заявка (свой вынос)")
+async def start_new_order_hookah(message: Message, state: FSMContext) -> None:
+    if get_role(message.from_user.id) not in ("hookah", "hookah_chief", "admin"):
+        return
+    await start_hookah_own_order(message, state)
 
 
 @router.callback_query(NewOrder.choosing_table, F.data.startswith("table:"))
@@ -433,7 +489,7 @@ async def enter_congrats(message: Message, state: FSMContext) -> None:
     if data.get("bday_variant") == "alcohol_track":
         # трек уже подразумевается этим вариантом ДР
         await state.update_data(track=True)
-        await ask_note(message, state)
+        await ask_hookah(message, state)
     else:
         await state.set_state(NewOrder.asking_track)
         await message.answer("Нужен трек? (тегнем Натали)", reply_markup=yes_no_keyboard("track"))
@@ -443,54 +499,24 @@ async def enter_congrats(message: Message, state: FSMContext) -> None:
 async def pick_track(callback: CallbackQuery, state: FSMContext) -> None:
     track = callback.data.split(":", 1)[1] == "yes"
     await state.update_data(track=track)
-    await ask_note(callback.message, state, edit=True)
+    await ask_hookah(callback.message, state, edit=True)
     await callback.answer()
 
 
-async def ask_note(message: Message, state: FSMContext, edit: bool = False) -> None:
-    await state.set_state(NewOrder.entering_note)
-    text = "Пришли фото к заявке или просто напиши текст-комментарий."
-    if edit:
-        await message.edit_text(text)
-    else:
-        await message.answer(text)
-
-
-@router.message(NewOrder.entering_note, F.photo)
-async def enter_note_photo(message: Message, state: FSMContext) -> None:
-    await state.update_data(note_photo_id=message.photo[-1].file_id, note_text=message.caption)
-    await try_delete(message)
-    await ask_hookah(message, state)
-
-
-@router.message(NewOrder.entering_note)
-async def enter_note_text(message: Message, state: FSMContext) -> None:
-    await state.update_data(note_text=message.text.strip())
-    await try_delete(message)
-    await ask_hookah(message, state)
-
-
-async def ask_hookah(message: Message, state: FSMContext) -> None:
+async def ask_hookah(message: Message, state: FSMContext, edit: bool = False) -> None:
     await state.set_state(NewOrder.asking_hookah)
-    await message.answer("Добавка кальяном?", reply_markup=yes_no_keyboard("hookah"))
+    text = "Добавка кальяном?"
+    kb = yes_no_keyboard("hookah")
+    if edit:
+        await message.edit_text(text, reply_markup=kb)
+    else:
+        await message.answer(text, reply_markup=kb)
 
 
 @router.callback_query(NewOrder.asking_hookah, F.data.startswith("hookah:"))
 async def pick_hookah(callback: CallbackQuery, state: FSMContext) -> None:
     wants_hookah = callback.data.split(":", 1)[1] == "yes"
     await state.update_data(hookah=wants_hookah)
-    if wants_hookah:
-        await state.set_state(NewOrder.choosing_hookah_item)
-        await callback.message.edit_text("Выбери позицию:", reply_markup=hookah_menu_keyboard())
-    else:
-        await ask_big_check(callback.message, state, edit=True)
-    await callback.answer()
-
-
-@router.callback_query(NewOrder.choosing_hookah_item, F.data.startswith("hookahitem:"))
-async def pick_hookah_item(callback: CallbackQuery, state: FSMContext) -> None:
-    item = callback.data.split(":", 1)[1]
-    await state.update_data(hookah_item=item)
     await ask_big_check(callback.message, state, edit=True)
     await callback.answer()
 
@@ -509,11 +535,46 @@ async def ask_big_check(message: Message, state: FSMContext, edit: bool = False)
 async def pick_big_check(callback: CallbackQuery, state: FSMContext) -> None:
     big_check = callback.data.split(":", 1)[1] == "yes"
     await state.update_data(big_check=big_check)
+    await state.set_state(NewOrder.asking_note_yn)
+    await callback.message.edit_text(
+        "Добавить фото или текст к заявке? (необязательно)",
+        reply_markup=yes_no_keyboard("addnote"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(NewOrder.asking_note_yn, F.data.startswith("addnote:"))
+async def pick_add_note(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.data.split(":", 1)[1] == "no":
+        await go_to_confirm(callback.message, state, edit=True)
+    else:
+        await state.set_state(NewOrder.entering_note)
+        await callback.message.edit_text("Пришли фото из галереи или напиши текст.")
+    await callback.answer()
+
+
+@router.message(NewOrder.entering_note, F.photo)
+async def enter_note_photo(message: Message, state: FSMContext) -> None:
+    await state.update_data(note_photo_id=message.photo[-1].file_id, note_text=message.caption)
+    await try_delete(message)
+    await go_to_confirm(message, state)
+
+
+@router.message(NewOrder.entering_note)
+async def enter_note_text(message: Message, state: FSMContext) -> None:
+    await state.update_data(note_text=message.text.strip())
+    await try_delete(message)
+    await go_to_confirm(message, state)
+
+
+async def go_to_confirm(message: Message, state: FSMContext, edit: bool = False) -> None:
     await state.set_state(NewOrder.confirming)
     data = await state.get_data()
     summary = build_summary(data)
-    await callback.message.edit_text(summary, reply_markup=confirm_keyboard(), parse_mode=ParseMode.HTML)
-    await callback.answer()
+    if edit:
+        await message.edit_text(summary, reply_markup=confirm_keyboard(), parse_mode=ParseMode.HTML)
+    else:
+        await message.answer(summary, reply_markup=confirm_keyboard(), parse_mode=ParseMode.HTML)
 
 
 def build_summary(data: dict) -> str:
@@ -529,7 +590,7 @@ def build_summary(data: dict) -> str:
         lines.append(f"Комментарий: {data['note_text']}")
     if data.get("note_photo_id"):
         lines.append("Фото: приложено")
-    lines.append(f"Кальян: {data.get('hookah_item') if data.get('hookah') else 'нет'}")
+    lines.append(f"Кальян: {'да (вкус выберет кальянщик)' if data.get('hookah') else 'нет'}")
     lines.append(f"Чек 200+: {'да' if data.get('big_check') else 'нет'}")
     return "\n".join(lines)
 
@@ -570,6 +631,126 @@ async def send_order(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer("Отправлено")
 
 
+# ---------------------------------------------------------------------------
+# СОБСТВЕННЫЙ ВЫНОС КАЛЬЯНЩИКА (без официанта)
+# ---------------------------------------------------------------------------
+
+
+class HookahOwnOrder(StatesGroup):
+    choosing_table = State()
+    choosing_item = State()
+    asking_track = State()
+    asking_announce = State()
+    entering_announce = State()
+    confirming = State()
+
+
+def hookah_own_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Всё верно, отправить", callback_data="hown_confirm:send")],
+        [InlineKeyboardButton(text="✏️ Начать заново", callback_data="hown_confirm:restart")],
+    ])
+
+
+async def start_hookah_own_order(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(HookahOwnOrder.choosing_table)
+    await message.answer("Свой вынос с кальяном. Выбери стол:", reply_markup=tables_keyboard())
+
+
+@router.callback_query(HookahOwnOrder.choosing_table, F.data.startswith("table:"))
+async def hown_pick_table(callback: CallbackQuery, state: FSMContext) -> None:
+    table = callback.data.split(":", 1)[1]
+    await state.update_data(table=table, is_vip_table=table in VIP_TABLES)
+    await state.set_state(HookahOwnOrder.choosing_item)
+    await callback.message.edit_text(f"Стол {table}. Какой кальян?", reply_markup=hookah_menu_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(HookahOwnOrder.choosing_item, F.data.startswith("hookahitem:"))
+async def hown_pick_item(callback: CallbackQuery, state: FSMContext) -> None:
+    item = callback.data.split(":", 1)[1]
+    await state.update_data(hookah_item=item)
+    await state.set_state(HookahOwnOrder.asking_track)
+    await callback.message.edit_text("Нужен трек? (тегнем Натали)", reply_markup=yes_no_keyboard("hown_track"))
+    await callback.answer()
+
+
+@router.callback_query(HookahOwnOrder.asking_track, F.data.startswith("hown_track:"))
+async def hown_pick_track(callback: CallbackQuery, state: FSMContext) -> None:
+    track = callback.data.split(":", 1)[1] == "yes"
+    await state.update_data(track=track)
+    await state.set_state(HookahOwnOrder.asking_announce)
+    await callback.message.edit_text("Нужен текст для МС — что сказать?", reply_markup=yes_no_keyboard("hown_announce"))
+    await callback.answer()
+
+
+@router.callback_query(HookahOwnOrder.asking_announce, F.data.startswith("hown_announce:"))
+async def hown_pick_announce(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.data.split(":", 1)[1] == "no":
+        await state.update_data(announce_text=None)
+        await hown_go_to_confirm(callback.message, state, edit=True)
+    else:
+        await state.set_state(HookahOwnOrder.entering_announce)
+        await callback.message.edit_text("Напиши текст, что сказать МС.")
+    await callback.answer()
+
+
+@router.message(HookahOwnOrder.entering_announce)
+async def hown_enter_announce(message: Message, state: FSMContext) -> None:
+    await state.update_data(announce_text=message.text.strip())
+    await try_delete(message)
+    await hown_go_to_confirm(message, state)
+
+
+async def hown_go_to_confirm(message: Message, state: FSMContext, edit: bool = False) -> None:
+    await state.set_state(HookahOwnOrder.confirming)
+    data = await state.get_data()
+    lines = ["<b>Проверь заявку:</b>", ""]
+    lines.append(f"Стол: {data.get('table')}")
+    lines.append(f"Кальян: {data.get('hookah_item')}")
+    lines.append(f"Трек: {'да' if data.get('track') else 'нет'}")
+    if data.get("announce_text"):
+        lines.append(f"Текст для МС: {data['announce_text']}")
+    text = "\n".join(lines)
+    if edit:
+        await message.edit_text(text, reply_markup=hookah_own_confirm_keyboard(), parse_mode=ParseMode.HTML)
+    else:
+        await message.answer(text, reply_markup=hookah_own_confirm_keyboard(), parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(HookahOwnOrder.confirming, F.data == "hown_confirm:restart")
+async def hown_restart(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(HookahOwnOrder.choosing_table)
+    await callback.message.edit_text("Начинаем заново. Выбери стол:", reply_markup=tables_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(HookahOwnOrder.confirming, F.data == "hown_confirm:send")
+async def hown_send(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    chat_id = callback.message.chat.id
+    chat_state = get_state(chat_id)
+
+    order = chat_state.add_order(
+        table=data["table"],
+        is_vip_table=data.get("is_vip_table", False),
+        order_type="vynos",
+        track=data.get("track", False),
+        hookah=True,
+        hookah_item=data.get("hookah_item"),
+        announce_text=data.get("announce_text"),
+        no_waiter=True,
+        dancer=True,
+        hookah_name=callback.from_user.full_name,
+    )
+
+    await state.clear()
+    await callback.message.edit_text(f"✅ Свой вынос по столу {order.table} отправлен на подтверждение.")
+    await refresh_all_views(callback.bot, chat_id)
+    await callback.answer("Отправлено")
+
+
 async def try_delete(message: Message) -> None:
     try:
         await message.delete()
@@ -591,7 +772,8 @@ def order_summary_line(o: Order) -> str:
     if o.hookah:
         tags.append(f"кальян: {o.hookah_item or '?'}")
     if o.track:
-        tags.append(f"трек, cc @{MC_USERNAME} @{MUSIC_USERNAME}")
+        track_status = "🟢 трек готов" if o.ready_track else "🟡 трек готовится"
+        tags.append(f"{track_status} (cc @{MC_USERNAME} @{MUSIC_USERNAME})")
     tag_str = f" ({', '.join(tags)})" if tags else ""
     status_label = {
         "collecting": "🟡 Собирается",
@@ -603,7 +785,7 @@ def order_summary_line(o: Order) -> str:
 
 def render_waiter(chat_state: ChatState, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     orders = [o for o in chat_state.active_orders()]
-    lines = ["<b>👤 Мои заявки</b>", ""]
+    lines = ["<b>📋 Заявки</b>", ""]
     rows = []
     if not orders:
         lines.append("Нет активных заявок.")
@@ -622,10 +804,42 @@ def render_hookah(chat_state: ChatState, chief: bool) -> tuple[str, InlineKeyboa
     if not orders:
         lines.append("Нет заявок с кальяном.")
     for o in orders:
-        status = "✅ готов" if o.ready_hookah else "⏳ ждём"
-        lines.append(f"Стол {o.table} — {o.hookah_item} — {status}")
-        if not o.ready_hookah:
+        if not o.hookah_name:
+            lines.append(f"Стол {o.table} — не взято")
+            rows.append([InlineKeyboardButton(text=f"🫴 Взять — Стол {o.table}", callback_data=f"take_hookah:{o.id}")])
+        elif not o.ready_hookah:
+            lines.append(f"Стол {o.table} — {o.hookah_item} — готовит {o.hookah_name}")
             rows.append([InlineKeyboardButton(text=f"✅ Готов — Стол {o.table}", callback_data=f"ready_h:{o.id}")])
+        else:
+            lines.append(f"Стол {o.table} — {o.hookah_item} — ✅ готов ({o.hookah_name})")
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def render_music(chat_state: ChatState) -> tuple[str, InlineKeyboardMarkup]:
+    orders = [o for o in chat_state.active_orders() if o.track]
+    lines = ["<b>🎵 Треки</b>", ""]
+    rows = []
+    if not orders:
+        lines.append("Нет заявок с треком.")
+    for o in orders:
+        status = "✅ готов" if o.ready_track else "⏳ ищем"
+        song = f" — «{o.congrats_text}»" if o.congrats_text else ""
+        lines.append(f"Стол {o.table}{song} — {status}")
+        if not o.ready_track:
+            rows.append([InlineKeyboardButton(text=f"✅ Готов — Стол {o.table}", callback_data=f"ready_t:{o.id}")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def render_dancer(chat_state: ChatState) -> tuple[str, InlineKeyboardMarkup]:
+    orders = chat_state.active_orders()
+    lines = ["<b>💃 Мои выносы</b>", ""]
+    rows = []
+    if not orders:
+        lines.append("Пока пусто.")
+    for o in orders:
+        lines.append(order_summary_line(o))
+        if o.dancer and not o.ready_dancer:
+            rows.append([InlineKeyboardButton(text=f"✅ Готовы — Стол {o.table}", callback_data=f"ready_dc:{o.id}")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -643,6 +857,8 @@ def render_mc(chat_state: ChatState) -> tuple[str, InlineKeyboardMarkup]:
         lines.append(order_summary_line(o))
         if o.congrats_text:
             lines.append(f"    💬 «{o.congrats_text}»")
+        if o.announce_text:
+            lines.append(f"    💬 «{o.announce_text}»")
         text = "⏸ На паузе" if chat_state.paused else f"📣 Объявить — Стол {o.table}"
         rows.append([InlineKeyboardButton(text=text, callback_data=f"announce:{o.id}")])
     lines.append("")
@@ -651,21 +867,23 @@ def render_mc(chat_state: ChatState) -> tuple[str, InlineKeyboardMarkup]:
         lines.append("Пусто.")
     for o in waiting:
         lines.append(order_summary_line(o))
+        if o.no_waiter and not o.ready_mc:
+            rows.append([InlineKeyboardButton(text=f"✅ Готов — Стол {o.table}", callback_data=f"ready_mc:{o.id}")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def render_manager(chat_state: ChatState) -> tuple[str, InlineKeyboardMarkup]:
     orders = chat_state.active_orders()
-    lines = ["<b>🧑‍💼 Менеджер</b>", ""]
+    lines = ["<b>🧑‍💼 Менеджер / всё сразу</b>", ""]
     rows = []
     if chat_state.current_show:
-        lines.append(f"🎬 Идёт номер: <b>{chat_state.current_show}</b> (через «Начать номер»)")
+        lines.append(f"🎬 Идёт номер: <b>{chat_state.current_show}</b> (через «Программа»)")
     else:
         pause_text = "▶ Возобновить" if chat_state.paused else "⏸ Пауза"
         rows.append([InlineKeyboardButton(text=pause_text, callback_data="toggle_pause")])
         lines.append("⏸ Пауза активна" if chat_state.paused else "Очередь активна")
     lines.append("")
-    lines.append("<b>Очередь:</b>")
+    lines.append("<b>Очередь (все заявки, все статусы):</b>")
     if not orders:
         lines.append("Пусто.")
     for o in orders:
@@ -679,6 +897,8 @@ VIEW_RENDERERS = {
     "waiter": lambda cs, uid: render_waiter(cs, uid),
     "hookah": lambda cs, uid: render_hookah(cs, False),
     "hookah_chief": lambda cs, uid: render_hookah(cs, True),
+    "music": lambda cs, uid: render_music(cs),
+    "dancer": lambda cs, uid: render_dancer(cs),
     "mc": lambda cs, uid: render_mc(cs),
     "manager": lambda cs, uid: render_manager(cs),
 }
@@ -705,7 +925,7 @@ async def refresh_all_views(bot: Bot, chat_id: int) -> None:
             chat_state.view_message_ids.pop(key, None)
 
 
-@router.message(F.text == "👤 Мои заявки")
+@router.message(F.text == "📋 Просмотреть заявки")
 async def btn_waiter(message: Message) -> None:
     await show_view(message.bot, message.chat.id, "waiter", message.from_user.id)
 
@@ -720,6 +940,16 @@ async def btn_hookah_chief(message: Message) -> None:
     await show_view(message.bot, message.chat.id, "hookah_chief", message.from_user.id)
 
 
+@router.message(F.text == "🎵 Треки")
+async def btn_music(message: Message) -> None:
+    await show_view(message.bot, message.chat.id, "music", message.from_user.id)
+
+
+@router.message(F.text == "💃 Мои выносы")
+async def btn_dancer(message: Message) -> None:
+    await show_view(message.bot, message.chat.id, "dancer", message.from_user.id)
+
+
 @router.message(F.text == "🎤 Экран MC")
 async def btn_mc(message: Message) -> None:
     await show_view(message.bot, message.chat.id, "mc", message.from_user.id)
@@ -727,6 +957,13 @@ async def btn_mc(message: Message) -> None:
 
 @router.message(F.text == "🧑‍💼 Менеджер")
 async def btn_manager(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    await show_view(message.bot, message.chat.id, "manager", message.from_user.id)
+
+
+@router.message(F.text == "👀 Всё сразу")
+async def btn_overview(message: Message) -> None:
     if not is_admin(message.from_user.id):
         return
     await show_view(message.bot, message.chat.id, "manager", message.from_user.id)
@@ -753,6 +990,47 @@ async def on_ready_waiter(callback: CallbackQuery) -> None:
     await callback.answer("Готов")
 
 
+@router.callback_query(F.data.startswith("take_hookah:"))
+async def on_take_hookah(callback: CallbackQuery) -> None:
+    order_id = int(callback.data.split(":")[1])
+    chat_state = get_state(callback.message.chat.id)
+    order = chat_state.orders.get(order_id)
+    if not order:
+        await callback.answer("Не найдено", show_alert=True)
+        return
+    if order.hookah_name:
+        await callback.answer("Уже взято", show_alert=True)
+        return
+    rows = [[InlineKeyboardButton(text=item, callback_data=f"hookahclaim:{order_id}:{item}")] for item in HOOKAH_MENU]
+    await callback.bot.send_message(
+        callback.message.chat.id,
+        f"Стол {order.table} — выбери вкус:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("hookahclaim:"))
+async def on_hookah_claim(callback: CallbackQuery) -> None:
+    _, order_id_str, item = callback.data.split(":", 2)
+    order_id = int(order_id_str)
+    chat_id = callback.message.chat.id
+    chat_state = get_state(chat_id)
+    order = chat_state.orders.get(order_id)
+    if not order:
+        await callback.answer("Не найдено", show_alert=True)
+        return
+    if order.hookah_name:
+        await callback.message.delete()
+        await callback.answer("Уже взято кем-то другим", show_alert=True)
+        return
+    order.hookah_item = item
+    order.hookah_name = callback.from_user.full_name
+    await callback.message.delete()
+    await refresh_all_views(callback.bot, chat_id)
+    await callback.answer(f"Взял: {item}")
+
+
 @router.callback_query(F.data.startswith("ready_h:"))
 async def on_ready_hookah(callback: CallbackQuery) -> None:
     order_id = int(callback.data.split(":")[1])
@@ -762,12 +1040,60 @@ async def on_ready_hookah(callback: CallbackQuery) -> None:
         await callback.answer("Не найдено", show_alert=True)
         return
     order.ready_hookah = True
-    order.hookah_name = callback.from_user.full_name
     if order.is_fully_ready():
         order.status = "ready"
         order.ready_at = datetime.now(TIMEZONE)
     await refresh_all_views(callback.bot, callback.message.chat.id)
     await callback.answer("Готов")
+
+
+@router.callback_query(F.data.startswith("ready_t:"))
+async def on_ready_track(callback: CallbackQuery) -> None:
+    order_id = int(callback.data.split(":")[1])
+    chat_state = get_state(callback.message.chat.id)
+    order = chat_state.orders.get(order_id)
+    if not order:
+        await callback.answer("Не найдено", show_alert=True)
+        return
+    order.ready_track = True
+    order.music_name = callback.from_user.full_name
+    if order.is_fully_ready():
+        order.status = "ready"
+        order.ready_at = datetime.now(TIMEZONE)
+    await refresh_all_views(callback.bot, callback.message.chat.id)
+    await callback.answer("Трек готов")
+
+
+@router.callback_query(F.data.startswith("ready_mc:"))
+async def on_ready_mc(callback: CallbackQuery) -> None:
+    order_id = int(callback.data.split(":")[1])
+    chat_state = get_state(callback.message.chat.id)
+    order = chat_state.orders.get(order_id)
+    if not order:
+        await callback.answer("Не найдено", show_alert=True)
+        return
+    order.ready_mc = True
+    if order.is_fully_ready():
+        order.status = "ready"
+        order.ready_at = datetime.now(TIMEZONE)
+    await refresh_all_views(callback.bot, callback.message.chat.id)
+    await callback.answer("Готов")
+
+
+@router.callback_query(F.data.startswith("ready_dc:"))
+async def on_ready_dancer(callback: CallbackQuery) -> None:
+    order_id = int(callback.data.split(":")[1])
+    chat_state = get_state(callback.message.chat.id)
+    order = chat_state.orders.get(order_id)
+    if not order:
+        await callback.answer("Не найдено", show_alert=True)
+        return
+    order.ready_dancer = True
+    if order.is_fully_ready():
+        order.status = "ready"
+        order.ready_at = datetime.now(TIMEZONE)
+    await refresh_all_views(callback.bot, callback.message.chat.id)
+    await callback.answer("Готовы")
 
 
 @router.callback_query(F.data.startswith("announce:"))
@@ -814,57 +1140,205 @@ async def on_toggle_pause(callback: CallbackQuery) -> None:
 
 
 # ---------------------------------------------------------------------------
-# ШОУ-НОМЕРА (админ)
+# ПРОГРАММА ВЕЧЕРА (расписание номеров, админ)
 # ---------------------------------------------------------------------------
 
+# Шаблон по умолчанию — то, что предложится при первой настройке.
+# Дальше последняя подтверждённая программа сама становится шаблоном на завтра.
+DEFAULT_PROGRAM_TEMPLATE = [
+    {"time": "23:30", "name": "Интро"},
+    {"time": "00:00", "name": "Выступление артиста"},
+    {"time": "00:30", "name": "Интро 2"},
+    {"time": "01:00", "name": "Вау-эффект"},
+]
+program_template: list[dict] = [dict(x) for x in DEFAULT_PROGRAM_TEMPLATE]
 
-def show_pick_keyboard() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text=s, callback_data=f"show_pick:{s}")] for s in SHOW_SEGMENTS]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+class ProgramSetup(StatesGroup):
+    entering_lines = State()
 
 
-@router.message(F.text == "🎬 Начать номер")
-async def btn_show(message: Message) -> None:
+def parse_program_text(text: str) -> list[dict]:
+    """Строки вида 'ЧЧ:ММ Название' по одной на строку."""
+    items = []
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(maxsplit=1)
+        if len(parts) == 2 and ":" in parts[0]:
+            items.append({"time": parts[0], "name": parts[1]})
+        else:
+            items.append({"time": "", "name": line})
+    return items
+
+
+def program_setup_prompt_text() -> str:
+    example = "\n".join(f"{s['time']} {s['name']}" for s in DEFAULT_PROGRAM_TEMPLATE)
+    return (
+        "Пришли программу на сегодня, по одной строке на номер, формат «время название»:\n\n"
+        f"<code>{example}</code>"
+    )
+
+
+@router.message(F.text == "🎬 Программа")
+async def btn_program_menu(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id):
         return
     chat_state = get_state(message.chat.id)
-    if chat_state.current_show:
-        await message.reply(f"Сейчас уже идёт «{chat_state.current_show}».")
+    if not chat_state.show_program:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📋 Использовать вчерашнюю программу", callback_data="prog:use_template")],
+            [InlineKeyboardButton(text="✏️ Ввести заново", callback_data="prog:new")],
+        ])
+        await message.answer("Программа на сегодня ещё не настроена.", reply_markup=kb)
         return
-    await message.answer("Какой номер начинается?", reply_markup=show_pick_keyboard())
+    await show_program_screen(message.bot, message.chat.id)
 
 
-@router.callback_query(F.data.startswith("show_pick:"))
-async def on_show_pick(callback: CallbackQuery) -> None:
-    segment = callback.data.split(":", 1)[1]
+@router.callback_query(F.data == "prog:use_template")
+async def on_prog_use_template(callback: CallbackQuery) -> None:
+    chat_state = get_state(callback.message.chat.id)
+    chat_state.show_program = [dict(x, started=False, done=False) for x in program_template]
+    chat_state.current_show_index = None
+    await callback.message.delete()
+    await show_program_screen(callback.bot, callback.message.chat.id)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "prog:new")
+async def on_prog_new(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(ProgramSetup.entering_lines)
+    await callback.message.edit_text(program_setup_prompt_text(), parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+
+@router.message(ProgramSetup.entering_lines)
+async def enter_program_lines(message: Message, state: FSMContext) -> None:
+    global program_template
+    items = parse_program_text(message.text)
+    if not items:
+        await message.reply("Не понял формат, попробуй ещё раз.")
+        return
+    chat_state = get_state(message.chat.id)
+    chat_state.show_program = [dict(x, started=False, done=False) for x in items]
+    chat_state.current_show_index = None
+    program_template = [dict(x) for x in items]  # запоминаем как шаблон на будущее
+    await state.clear()
+    await try_delete(message)
+    await show_program_screen(message.bot, message.chat.id)
+
+
+def render_program(chat_state: ChatState) -> tuple[str, InlineKeyboardMarkup]:
+    lines = ["<b>🎬 Программа вечера</b>", ""]
+    rows = []
+    active_idx = chat_state.current_show_index
+
+    for i, seg in enumerate(chat_state.show_program):
+        mark = "▶️ " if i == active_idx else ("✅ " if seg["done"] else "▫️ ")
+        time_part = f"{seg['time']} — " if seg["time"] else ""
+        lines.append(f"{mark}{time_part}{seg['name']}")
+
+    lines.append("")
+    if active_idx is not None:
+        lines.append("Очередь выносов на паузе, пока номер идёт.")
+        rows.append([InlineKeyboardButton(text="⏹ Номер закончился", callback_data="prog_end")])
+    else:
+        next_idx = next((i for i, s in enumerate(chat_state.show_program) if not s["done"]), None)
+        if next_idx is not None:
+            rows.append([InlineKeyboardButton(
+                text=f"▶ Начать: {chat_state.show_program[next_idx]['name']}",
+                callback_data=f"prog_start:{next_idx}",
+            )])
+        else:
+            lines.append("Программа на сегодня завершена.")
+
+    rows.append([
+        InlineKeyboardButton(text="⏩ +5 мин", callback_data="prog_shift:5"),
+        InlineKeyboardButton(text="+10", callback_data="prog_shift:10"),
+        InlineKeyboardButton(text="+15", callback_data="prog_shift:15"),
+        InlineKeyboardButton(text="+30", callback_data="prog_shift:30"),
+    ])
+    rows.append([InlineKeyboardButton(text="✏️ Настроить заново", callback_data="prog:new")])
+
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def show_program_screen(bot: Bot, chat_id: int) -> None:
+    chat_state = get_state(chat_id)
+    text, kb = render_program(chat_state)
+    if chat_state.program_message_id:
+        try:
+            await bot.edit_message_text(text, chat_id=chat_id, message_id=chat_state.program_message_id, reply_markup=kb, parse_mode=ParseMode.HTML)
+            return
+        except TelegramBadRequest:
+            pass
+    msg = await bot.send_message(chat_id, text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    chat_state.program_message_id = msg.message_id
+
+
+@router.callback_query(F.data.startswith("prog_start:"))
+async def on_prog_start(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Только админ", show_alert=True)
+        return
+    idx = int(callback.data.split(":")[1])
     chat_id = callback.message.chat.id
     chat_state = get_state(chat_id)
-    chat_state.current_show = segment
+    chat_state.current_show_index = idx
+    chat_state.show_program[idx]["started"] = True
+    chat_state.current_show = chat_state.show_program[idx]["name"]
     chat_state.paused = True
+
     tags = " ".join([f"@{MC_USERNAME}", f"@{DJ_USERNAME}"] + [f"@{u}" for u in DANCER_USERNAMES])
-    await callback.message.edit_text(
-        f"🎬 <b>Идёт номер: {segment}</b>\nОчередь на паузе.\n\n{tags}",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⏹ Номер закончился", callback_data="show_end")]]),
+    await callback.bot.send_message(
+        chat_id,
+        f"🎬 <b>Идёт номер: {chat_state.current_show}</b>\nОчередь выносов на паузе.\n\n{tags}",
         parse_mode=ParseMode.HTML,
     )
-    try:
-        await callback.bot.pin_chat_message(chat_id, callback.message.message_id)
-    except TelegramBadRequest:
-        pass
     await refresh_all_views(callback.bot, chat_id)
-    await callback.answer("Объявлено")
+    await show_program_screen(callback.bot, chat_id)
+    await callback.answer("Начали")
 
 
-@router.callback_query(F.data == "show_end")
-async def on_show_end(callback: CallbackQuery) -> None:
+@router.callback_query(F.data == "prog_end")
+async def on_prog_end(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Только админ", show_alert=True)
+        return
     chat_id = callback.message.chat.id
     chat_state = get_state(chat_id)
-    finished = chat_state.current_show or "номер"
+    idx = chat_state.current_show_index
+    if idx is not None:
+        chat_state.show_program[idx]["done"] = True
+    chat_state.current_show_index = None
     chat_state.current_show = None
     chat_state.paused = False
-    await callback.message.edit_text(f"✅ «{finished}» завершён. Очередь возобновлена.")
     await refresh_all_views(callback.bot, chat_id)
+    await show_program_screen(callback.bot, chat_id)
     await callback.answer("Возобновлено")
+
+
+@router.callback_query(F.data.startswith("prog_shift:"))
+async def on_prog_shift(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Только админ", show_alert=True)
+        return
+    minutes = int(callback.data.split(":")[1])
+    chat_state = get_state(callback.message.chat.id)
+    shifted = 0
+    for seg in chat_state.show_program:
+        if seg["done"] or seg["started"] or not seg["time"]:
+            continue
+        try:
+            h, m = map(int, seg["time"].split(":"))
+            total = (h * 60 + m + minutes) % (24 * 60)
+            seg["time"] = f"{total // 60:02d}:{total % 60:02d}"
+            shifted += 1
+        except ValueError:
+            continue
+    await show_program_screen(callback.bot, callback.message.chat.id)
+    await callback.answer(f"Сдвинул на +{minutes} мин ({shifted} номеров)")
 
 
 # ---------------------------------------------------------------------------
@@ -954,18 +1428,21 @@ async def daily_stats_job(bot: Bot) -> None:
 # ---------------------------------------------------------------------------
 
 
-@router.message(F.text == "👥 Роли сотрудников")
-async def btn_roles(message: Message) -> None:
+# ---------------------------------------------------------------------------
+# РОЛИ СОТРУДНИКОВ (вход по коду; админ может посмотреть коды и назначить вручную)
+# ---------------------------------------------------------------------------
+
+
+@router.message(Command("codes"))
+async def cmd_codes(message: Message) -> None:
     if not is_admin(message.from_user.id):
         return
-    await message.answer(
-        "Чтобы назначить роль сотруднику: попроси его написать боту /start, "
-        "он выберет роль сам через кнопки. Если нужно назначить роль другому "
-        "человеку напрямую, пришли мне его user_id и роль в формате:\n"
-        "<code>/setrole USER_ID роль</code>\n"
-        "Роли: waiter, hookah, hookah_chief, mc, admin",
-        parse_mode=ParseMode.HTML,
-    )
+    lines = ["<b>Коды ролей:</b>"]
+    for code, role in ROLE_CODES.items():
+        lines.append(f"{code} → {ROLE_LABELS.get(role, role)}")
+    lines.append("")
+    lines.append("Поменять коды: переменная ROLE_CODES на Railway, формат waiter=1111,hookah=2222,...")
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("setrole"))
@@ -974,7 +1451,7 @@ async def cmd_setrole(message: Message) -> None:
         return
     parts = message.text.split()
     if len(parts) != 3 or parts[2] not in ROLE_LABELS:
-        await message.reply("Формат: /setrole USER_ID роль (waiter/hookah/hookah_chief/mc/admin)")
+        await message.reply("Формат: /setrole USER_ID роль (waiter/hookah/hookah_chief/mc/dancer/music/admin)")
         return
     target_id = int(parts[1])
     user_roles[target_id] = parts[2]
@@ -986,7 +1463,7 @@ async def cmd_setrole(message: Message) -> None:
 @router.message(F.text.lower().in_({"старт", "start", "/ start", "меню", "menu"}))
 async def fallback_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await cmd_start(message)
+    await cmd_start(message, state)
 
 
 # ---------------------------------------------------------------------------
