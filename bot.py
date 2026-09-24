@@ -287,25 +287,34 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         await message.answer(f"Ты вошёл как: {ROLE_LABELS[role]}", reply_markup=role_keyboard(message.from_user.id))
     else:
         await state.set_state(RolePick.entering_code)
-        await message.answer("Введи код своей роли (его даёт админ):")
+        prompt = await message.answer("Введи код своей роли (его даёт админ):")
+        await state.update_data(prompt_id=prompt.message_id)
 
 
 @router.message(F.text == "🔄 Сменить роль")
 async def switch_role(message: Message, state: FSMContext) -> None:
     await state.set_state(RolePick.entering_code)
-    await message.answer("Введи код роли, на которую хочешь переключиться:")
+    prompt = await message.answer("Введи код роли, на которую хочешь переключиться:")
+    await state.update_data(prompt_id=prompt.message_id)
 
 
 @router.message(RolePick.entering_code)
 async def enter_role_code(message: Message, state: FSMContext) -> None:
     code = message.text.strip()
     role = ROLE_CODES.get(code)
+    data = await state.get_data()
+    prompt_id = data.get("prompt_id")
     await try_delete(message)
     if not role:
         await message.answer("Код не найден. Попробуй ещё раз или уточни у админа.")
         return
     user_roles[message.from_user.id] = role
     await state.clear()
+    if prompt_id:
+        try:
+            await message.bot.delete_message(message.chat.id, prompt_id)
+        except TelegramBadRequest:
+            pass
     await message.answer(f"Готово, ты — {ROLE_LABELS[role]}", reply_markup=role_keyboard(message.from_user.id))
 
 
@@ -381,8 +390,10 @@ def bday_variant_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def alcohol_keyboard() -> InlineKeyboardMarkup:
+def alcohol_keyboard(allow_none: bool = False) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=a, callback_data=f"alcohol:{a}")] for a in ALCOHOL_OPTIONS]
+    if allow_none:
+        rows.append([InlineKeyboardButton(text="Без алкоголя", callback_data="alcohol:none")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -433,13 +444,7 @@ async def pick_type(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.message.edit_text("Какой вариант поздравления?", reply_markup=bday_variant_keyboard())
     else:
         await state.set_state(NewOrder.choosing_alcohol)
-        await callback.message.edit_text(
-            "Это на алкоголе?",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="Да, выбрать бутылку", callback_data="wantalcohol:yes")],
-                [InlineKeyboardButton(text="Нет", callback_data="wantalcohol:no")],
-            ]),
-        )
+        await callback.message.edit_text("Выбери бутылку:", reply_markup=alcohol_keyboard(allow_none=True))
     await callback.answer()
 
 
@@ -456,21 +461,10 @@ async def pick_bday_variant(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
-@router.callback_query(NewOrder.choosing_alcohol, F.data.startswith("wantalcohol:"))
-async def pick_wants_alcohol(callback: CallbackQuery, state: FSMContext) -> None:
-    if callback.data.split(":", 1)[1] == "no":
-        await state.update_data(alcohol=None)
-        await state.set_state(NewOrder.asking_track)
-        await callback.message.edit_text("Нужен трек? (тегнем Натали)", reply_markup=yes_no_keyboard("track"))
-    else:
-        await callback.message.edit_text("Выбери бутылку:", reply_markup=alcohol_keyboard())
-    await callback.answer()
-
-
 @router.callback_query(NewOrder.choosing_alcohol, F.data.startswith("alcohol:"))
 async def pick_alcohol(callback: CallbackQuery, state: FSMContext) -> None:
     alcohol = callback.data.split(":", 1)[1]
-    await state.update_data(alcohol=alcohol)
+    await state.update_data(alcohol=None if alcohol == "none" else alcohol)
     data = await state.get_data()
     if data.get("order_type") == "bday":
         await state.set_state(NewOrder.entering_congrats)
@@ -909,6 +903,10 @@ async def show_view(bot: Bot, chat_id: int, view: str, user_id: int) -> None:
     text, kb = VIEW_RENDERERS[view](chat_state, user_id)
     msg = await bot.send_message(chat_id, text, reply_markup=kb, parse_mode=ParseMode.HTML)
     chat_state.view_message_ids[f"{view}:{user_id}"] = msg.message_id
+    try:
+        await bot.pin_chat_message(chat_id, msg.message_id, disable_notification=True)
+    except TelegramBadRequest:
+        pass  # нет прав закреплять — не критично, просто не закрепится
 
 
 async def refresh_all_views(bot: Bot, chat_id: int) -> None:
