@@ -48,7 +48,7 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -103,13 +103,14 @@ ROLE_LABELS = {
     "mc": "MC",
     "dancer": "Танцовщица",
     "music": "Музыка (Натали)",
+    "art": "Арт-отдел",
     "admin": "Админ",
 }
 
 # Коды для входа в роль — задаются на Railway переменной ROLE_CODES вида
 # "waiter=1111,hookah=2222,hookah_chief=2223,mc=3333,dancer=4444,music=5555,admin=9999"
 # Без этой переменной используются коды по умолчанию ниже (смени их!).
-_DEFAULT_ROLE_CODES = "waiter=1111,hookah=2222,hookah_chief=2223,mc=3333,dancer=4444,music=5555,admin=9999"
+_DEFAULT_ROLE_CODES = "waiter=1111,hookah=2222,hookah_chief=2223,mc=3333,dancer=4444,music=5555,art=6666,admin=9999"
 ROLE_CODES: dict[str, str] = {}
 for pair in os.environ.get("ROLE_CODES", _DEFAULT_ROLE_CODES).split(","):
     if "=" in pair:
@@ -117,6 +118,7 @@ for pair in os.environ.get("ROLE_CODES", _DEFAULT_ROLE_CODES).split(","):
         ROLE_CODES[code.strip()] = role_key.strip()
 
 user_roles: dict[int, str] = {}
+user_names: dict[int, str] = {}
 # по умолчанию первый, кто напишет /start и введёт код админа, становится
 # админом; дальше админ может назначать роли другим через /setrole
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
@@ -130,6 +132,14 @@ def get_role(user_id: int) -> Optional[str]:
 
 def is_admin(user_id: int) -> bool:
     return get_role(user_id) == "admin"
+
+
+def can_manage_program(user_id: int) -> bool:
+    return get_role(user_id) in ("admin", "art")
+
+
+def employee_name(user_id: int) -> str:
+    return user_names.get(user_id, "Без имени")
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +252,15 @@ def get_state(chat_id: int) -> ChatState:
 router = Router()
 bot_instance: Optional[Bot] = None  # используется фоновой задачей статистики
 
+
+async def broadcast_to_staff(bot: Bot, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
+    """Дублирует важное сообщение всем сотрудникам, вошедшим в бота."""
+    for user_id in list(user_roles):
+        try:
+            await bot.send_message(user_id, text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            logger.info("Не удалось отправить сообщение сотруднику %s", user_id)
+
 # ---------------------------------------------------------------------------
 # КЛАВИАТУРА ПОД РОЛЬ
 # ---------------------------------------------------------------------------
@@ -267,8 +286,12 @@ def role_keyboard(user_id: int) -> ReplyKeyboardMarkup:
         rows.append(["💃 Мои выносы"])
     if role in ("mc", "music", "dancer"):
         rows.append(["🚻 Отошёл"])
+    if role in ("art", "admin"):
+        rows.append(["🎬 Программа"])
+    if role:
+        rows.append(["💬 Связь с отделами"])
     if role == "admin":
-        rows.append(["🧑‍💼 Менеджер", "🎬 Программа"])
+        rows.append(["🧑‍💼 Менеджер"])
         rows.append(["📊 Статистика", "👀 Всё сразу"])
 
     if not rows:
@@ -281,13 +304,22 @@ def role_keyboard(user_id: int) -> ReplyKeyboardMarkup:
 
 class RolePick(StatesGroup):
     entering_code = State()
+    entering_name = State()
+
+
+class DepartmentChat(StatesGroup):
+    choosing_department = State()
+    entering_message = State()
 
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext) -> None:
     role = get_role(message.from_user.id)
-    if role:
+    if role and employee_name(message.from_user.id) != "Без имени":
         await message.answer(f"Ты вошёл как: {ROLE_LABELS[role]}", reply_markup=role_keyboard(message.from_user.id))
+    elif role:
+        await state.set_state(RolePick.entering_name)
+        await message.answer("Напиши своё имя и фамилию — это будет отображаться в заявках:")
     else:
         await state.set_state(RolePick.entering_code)
         prompt = await message.answer("Введи код своей роли (его даёт админ):")
@@ -312,13 +344,75 @@ async def enter_role_code(message: Message, state: FSMContext) -> None:
         await message.answer("Код не найден. Попробуй ещё раз или уточни у админа.")
         return
     user_roles[message.from_user.id] = role
-    await state.clear()
+    await state.set_state(RolePick.entering_name)
     if prompt_id:
         try:
             await message.bot.delete_message(message.chat.id, prompt_id)
         except TelegramBadRequest:
             pass
-    await message.answer(f"Готово, ты — {ROLE_LABELS[role]}", reply_markup=role_keyboard(message.from_user.id))
+    await message.answer("Теперь напиши своё имя и фамилию — оно будет отображаться в заявках:")
+
+
+@router.message(RolePick.entering_name)
+async def enter_employee_name(message: Message, state: FSMContext) -> None:
+    name = (message.text or "").strip()
+    if len(name) < 2:
+        await message.answer("Напиши имя ещё раз, минимум два символа.")
+        return
+    user_names[message.from_user.id] = name[:80]
+    role = get_role(message.from_user.id)
+    await state.clear()
+    await try_delete(message)
+    await message.answer(
+        f"Готово, {name}. Твоя роль: {ROLE_LABELS.get(role, 'сотрудник')}",
+        reply_markup=role_keyboard(message.from_user.id),
+    )
+
+
+@router.message(F.text == "💬 Связь с отделами")
+async def open_department_chat(message: Message, state: FSMContext) -> None:
+    role = get_role(message.from_user.id)
+    rows = []
+    for role_key, label in ROLE_LABELS.items():
+        if role_key not in (role, "admin"):
+            rows.append([InlineKeyboardButton(text=label, callback_data=f"dept:{role_key}")])
+    await state.set_state(DepartmentChat.choosing_department)
+    await message.answer("Кому написать?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(DepartmentChat.choosing_department, F.data.startswith("dept:"))
+async def choose_department(callback: CallbackQuery, state: FSMContext) -> None:
+    target_role = callback.data.split(":", 1)[1]
+    await state.update_data(target_role=target_role)
+    await state.set_state(DepartmentChat.entering_message)
+    await callback.message.edit_text(f"Напиши сообщение для отдела «{ROLE_LABELS[target_role]}»:")
+    await callback.answer()
+
+
+@router.message(DepartmentChat.entering_message)
+async def send_department_message(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    target_role = data.get("target_role")
+    sender_role = get_role(message.from_user.id)
+    sender = employee_name(message.from_user.id)
+    recipients = [uid for uid, role in user_roles.items() if role == target_role]
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Сообщение не должно быть пустым. Напиши текст ещё раз:")
+        return
+    for user_id in recipients:
+        try:
+            await message.bot.send_message(
+                user_id,
+                f"💬 <b>Сообщение от отдела «{ROLE_LABELS.get(sender_role, 'сотрудник')}»</b>\n"
+                f"{sender}:\n{text}",
+                parse_mode=ParseMode.HTML,
+            )
+        except (TelegramBadRequest, TelegramForbiddenError):
+            pass
+    await state.clear()
+    await try_delete(message)
+    await message.answer("Сообщение отправлено.", reply_markup=role_keyboard(message.from_user.id))
 
 
 @router.message(F.text == "🚻 Отошёл")
@@ -501,7 +595,7 @@ async def enter_congrats(message: Message, state: FSMContext) -> None:
     if data.get("bday_variant") == "alcohol_track":
         # трек уже подразумевается этим вариантом ДР
         await state.update_data(track=True)
-        await ask_hookah(message, state)
+        await ask_required_note(message, state)
     else:
         await state.set_state(NewOrder.asking_track)
         await message.answer("Нужен трек? (тегнем Натали)", reply_markup=yes_no_keyboard("track"))
@@ -511,8 +605,20 @@ async def enter_congrats(message: Message, state: FSMContext) -> None:
 async def pick_track(callback: CallbackQuery, state: FSMContext) -> None:
     track = callback.data.split(":", 1)[1] == "yes"
     await state.update_data(track=track)
-    await ask_hookah(callback.message, state, edit=True)
+    if track:
+        await ask_required_note(callback.message, state, edit=True)
+    else:
+        await go_to_confirm(callback.message, state, edit=True)
     await callback.answer()
+
+
+async def ask_required_note(message: Message, state: FSMContext, edit: bool = False) -> None:
+    await state.set_state(NewOrder.entering_note)
+    text = "Пришли фото или текст к заявке — это обязательно при выборе трека."
+    if edit:
+        await message.edit_text(text)
+    else:
+        await message.answer(text)
 
 
 async def ask_hookah(message: Message, state: FSMContext, edit: bool = False) -> None:
@@ -569,14 +675,20 @@ async def pick_add_note(callback: CallbackQuery, state: FSMContext) -> None:
 async def enter_note_photo(message: Message, state: FSMContext) -> None:
     await state.update_data(note_photo_id=message.photo[-1].file_id, note_text=message.caption)
     await try_delete(message)
-    await go_to_confirm(message, state)
+    if (await state.get_data()).get("track"):
+        await ask_hookah(message, state)
+    else:
+        await go_to_confirm(message, state)
 
 
 @router.message(NewOrder.entering_note)
 async def enter_note_text(message: Message, state: FSMContext) -> None:
     await state.update_data(note_text=message.text.strip())
     await try_delete(message)
-    await go_to_confirm(message, state)
+    if (await state.get_data()).get("track"):
+        await ask_hookah(message, state)
+    else:
+        await go_to_confirm(message, state)
 
 
 async def go_to_confirm(message: Message, state: FSMContext, edit: bool = False) -> None:
@@ -675,7 +787,7 @@ async def send_order(callback: CallbackQuery, state: FSMContext) -> None:
         hookah=data.get("hookah", False),
         hookah_item=data.get("hookah_item"),
         big_check=data.get("big_check", False),
-        waiter_name=callback.from_user.full_name,
+        waiter_name=employee_name(callback.from_user.id),
     )
 
     await state.clear()
@@ -795,7 +907,7 @@ async def hown_send(callback: CallbackQuery, state: FSMContext) -> None:
         announce_text=data.get("announce_text"),
         no_waiter=True,
         dancer=True,
-        hookah_name=callback.from_user.full_name,
+        hookah_name=employee_name(callback.from_user.id),
     )
 
     await state.clear()
@@ -1105,7 +1217,7 @@ async def on_hookah_claim(callback: CallbackQuery) -> None:
         await callback.answer("Уже взято кем-то другим", show_alert=True)
         return
     order.hookah_item = item
-    order.hookah_name = callback.from_user.full_name
+    order.hookah_name = employee_name(callback.from_user.id)
     await callback.message.delete()
     await refresh_all_views(callback.bot, chat_id)
     await callback.answer(f"Взял: {item}")
@@ -1136,7 +1248,7 @@ async def on_ready_track(callback: CallbackQuery) -> None:
         await callback.answer("Не найдено", show_alert=True)
         return
     order.ready_track = True
-    order.music_name = callback.from_user.full_name
+    order.music_name = employee_name(callback.from_user.id)
     if order.is_fully_ready():
         order.status = "ready"
         order.ready_at = datetime.now(TIMEZONE)
@@ -1263,7 +1375,7 @@ def program_setup_prompt_text() -> str:
 
 @router.message(F.text == "🎬 Программа")
 async def btn_program_menu(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
+    if not can_manage_program(message.from_user.id):
         return
     chat_state = get_state(message.chat.id)
     if not chat_state.show_program:
@@ -1278,16 +1390,24 @@ async def btn_program_menu(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "prog:use_template")
 async def on_prog_use_template(callback: CallbackQuery) -> None:
+    if not can_manage_program(callback.from_user.id):
+        await callback.answer("Только админ или арт-отдел", show_alert=True)
+        return
     chat_state = get_state(callback.message.chat.id)
     chat_state.show_program = [dict(x, started=False, done=False) for x in program_template]
     chat_state.current_show_index = None
     await callback.message.delete()
     await show_program_screen(callback.bot, callback.message.chat.id)
+    text, _ = render_program(chat_state)
+    await broadcast_to_staff(callback.bot, "📢 <b>Шоу-программа обновлена:</b>\n\n" + text)
     await callback.answer()
 
 
 @router.callback_query(F.data == "prog:new")
 async def on_prog_new(callback: CallbackQuery, state: FSMContext) -> None:
+    if not can_manage_program(callback.from_user.id):
+        await callback.answer("Только админ или арт-отдел", show_alert=True)
+        return
     await state.set_state(ProgramSetup.entering_lines)
     await callback.message.edit_text(program_setup_prompt_text(), parse_mode=ParseMode.HTML)
     await callback.answer()
@@ -1307,6 +1427,8 @@ async def enter_program_lines(message: Message, state: FSMContext) -> None:
     await state.clear()
     await try_delete(message)
     await show_program_screen(message.bot, message.chat.id)
+    text, _ = render_program(chat_state)
+    await broadcast_to_staff(message.bot, "📢 <b>Шоу-программа обновлена:</b>\n\n" + text)
 
 
 def render_program(chat_state: ChatState) -> tuple[str, InlineKeyboardMarkup]:
@@ -1359,8 +1481,8 @@ async def show_program_screen(bot: Bot, chat_id: int) -> None:
 
 @router.callback_query(F.data.startswith("prog_start:"))
 async def on_prog_start(callback: CallbackQuery) -> None:
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Только админ", show_alert=True)
+    if not can_manage_program(callback.from_user.id):
+        await callback.answer("Только админ или арт-отдел", show_alert=True)
         return
     idx = int(callback.data.split(":")[1])
     chat_id = callback.message.chat.id
@@ -1378,13 +1500,15 @@ async def on_prog_start(callback: CallbackQuery) -> None:
     )
     await refresh_all_views(callback.bot, chat_id)
     await show_program_screen(callback.bot, chat_id)
+    text, _ = render_program(chat_state)
+    await broadcast_to_staff(callback.bot, "📢 <b>Изменение программы:</b>\n\n" + text)
     await callback.answer("Начали")
 
 
 @router.callback_query(F.data == "prog_end")
 async def on_prog_end(callback: CallbackQuery) -> None:
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Только админ", show_alert=True)
+    if not can_manage_program(callback.from_user.id):
+        await callback.answer("Только админ или арт-отдел", show_alert=True)
         return
     chat_id = callback.message.chat.id
     chat_state = get_state(chat_id)
@@ -1396,13 +1520,15 @@ async def on_prog_end(callback: CallbackQuery) -> None:
     chat_state.paused = False
     await refresh_all_views(callback.bot, chat_id)
     await show_program_screen(callback.bot, chat_id)
+    text, _ = render_program(chat_state)
+    await broadcast_to_staff(callback.bot, "📢 <b>Номер завершён, программа обновлена:</b>\n\n" + text)
     await callback.answer("Возобновлено")
 
 
 @router.callback_query(F.data.startswith("prog_shift:"))
 async def on_prog_shift(callback: CallbackQuery) -> None:
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Только админ", show_alert=True)
+    if not can_manage_program(callback.from_user.id):
+        await callback.answer("Только админ или арт-отдел", show_alert=True)
         return
     minutes = int(callback.data.split(":")[1])
     chat_state = get_state(callback.message.chat.id)
@@ -1418,6 +1544,8 @@ async def on_prog_shift(callback: CallbackQuery) -> None:
         except ValueError:
             continue
     await show_program_screen(callback.bot, callback.message.chat.id)
+    text, _ = render_program(chat_state)
+    await broadcast_to_staff(callback.bot, "📢 <b>Время шоу-программы изменено:</b>\n\n" + text)
     await callback.answer(f"Сдвинул на +{minutes} мин ({shifted} номеров)")
 
 
