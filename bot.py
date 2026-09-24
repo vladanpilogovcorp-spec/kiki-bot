@@ -14,8 +14,8 @@
 набирать команды вручную не нужно.
 
 СТОЛЫ:
-- VIP-группа (высший приоритет): VIP1, VIP2, VIP3, VIP4, 333, 555, 777
-- Обычные: 11-25, 31-33, 41-43, 51, 52, wc1, wc2
+- VIP-группа (высший приоритет): 1, 2, 3, 4, 333, 555, 777
+- Дополнительные: VIP1, VIP2, VIP3, VIP4, 11-25, 31-33, 41-43, 51, 52, wc1, wc2
 
 ЗАЯВКА:
 Стол → Вынос/ДР → (если ДР: текст / текст+алкоголь / текст+алкоголь+трек) →
@@ -27,8 +27,9 @@
 становится по-настоящему «готовой» только когда официант (и кальянщик, если
 он есть в заявке) оба нажали «Готов».
 
-Приоритет считается автоматически: стол из VIP-группы, отметка «чек 200+»
-и ДР поднимают заявку выше в очереди.
+Приоритет считается автоматически: VIP-стол, отметка «чек 200+», ДР и
+необходимость трека поднимают заявку выше в очереди. На экранах очереди
+бот показывает рекомендацию следующего выноса.
 
 В 06:00 бот сам присылает статистику за прошедшие сутки: сколько было
 выносов/ДР/кальянов, на каком алкоголе, и кто из сотрудников за сколько
@@ -74,13 +75,14 @@ DJ_USERNAME = os.environ.get("DJ_USERNAME", "dj_username")
 DANCER_USERNAMES = [u.strip() for u in os.environ.get("DANCER_USERNAMES", "dancer1,dancer2").split(",") if u.strip()]
 TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Moscow"))
 
-VIP_TABLES = ["VIP1", "VIP2", "VIP3", "VIP4", "333", "555", "777"]
+VIP_TABLES = ["1", "2", "3", "4", "333", "555", "777"]
 REGULAR_TABLES = [
+    "VIP1", "VIP2", "VIP3", "VIP4",
     "11", "12", "13", "14", "15", "16", "17", "18", "19", "20",
     "21", "22", "23", "24", "25", "31", "32", "33", "41", "42", "43",
     "51", "52", "wc1", "wc2",
 ]
-ALL_TABLES = VIP_TABLES + REGULAR_TABLES
+ALL_TABLES = VIP_TABLES + [t for t in REGULAR_TABLES if t not in VIP_TABLES]
 
 ALCOHOL_OPTIONS = ["Азуль", "Дон Периньон", "Дон Хулио", "Белуга 6л", "Кристалл"]
 HOOKAH_MENU = ["Кальян бутылка", "Кальян лакики бу", "Кальян Пайпай", "Кальян доби дог", "Кальян Арман 12 л", "Кальян флеш"]
@@ -195,8 +197,9 @@ class Order:
         vip_rank = 0 if self.is_vip_table else 1
         check_rank = 0 if self.big_check else 1
         bday_rank = 0 if self.order_type == "bday" else 1
+        show_rank = 0 if self.track else 1
         ref_time = self.ready_at or self.created_at
-        return (vip_rank, check_rank, bday_rank, ref_time)
+        return (vip_rank, check_rank, bday_rank, show_rank, ref_time)
 
 
 class ChatState:
@@ -405,7 +408,22 @@ def hookah_menu_keyboard() -> InlineKeyboardMarkup:
 def confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Всё верно, отправить", callback_data="confirm:send")],
+        [InlineKeyboardButton(text="✏️ Редактировать пункт", callback_data="confirm:edit")],
         [InlineKeyboardButton(text="✏️ Начать заново", callback_data="confirm:restart")],
+    ])
+
+
+def edit_order_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Стол", callback_data="edit_field:table"),
+         InlineKeyboardButton(text="Тип / ДР", callback_data="edit_field:type")],
+        [InlineKeyboardButton(text="Алкоголь", callback_data="edit_field:alcohol"),
+         InlineKeyboardButton(text="Текст", callback_data="edit_field:congrats")],
+        [InlineKeyboardButton(text="Трек", callback_data="edit_field:track"),
+         InlineKeyboardButton(text="Кальян", callback_data="edit_field:hookah")],
+        [InlineKeyboardButton(text="200+", callback_data="edit_field:bigcheck"),
+         InlineKeyboardButton(text="Фото / комментарий", callback_data="edit_field:note")],
+        [InlineKeyboardButton(text="↩️ Вернуться к проверке", callback_data="edit_field:back")],
     ])
 
 
@@ -587,6 +605,47 @@ def build_summary(data: dict) -> str:
     lines.append(f"Кальян: {'да (вкус выберет кальянщик)' if data.get('hookah') else 'нет'}")
     lines.append(f"Чек 200+: {'да' if data.get('big_check') else 'нет'}")
     return "\n".join(lines)
+
+
+@router.callback_query(NewOrder.confirming, F.data == "confirm:edit")
+async def open_order_editor(callback: CallbackQuery) -> None:
+    await callback.message.edit_text(
+        "Что именно изменить? Остальные данные заявки сохранятся:",
+        reply_markup=edit_order_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(NewOrder.confirming, F.data.startswith("edit_field:"))
+async def edit_order_field(callback: CallbackQuery, state: FSMContext) -> None:
+    field = callback.data.split(":", 1)[1]
+    if field == "back":
+        await go_to_confirm(callback.message, state, edit=True)
+    elif field == "table":
+        await state.set_state(NewOrder.choosing_table)
+        await callback.message.edit_text("Выбери новый стол:", reply_markup=tables_keyboard())
+    elif field == "type":
+        await state.set_state(NewOrder.choosing_type)
+        await callback.message.edit_text("Выбери новый тип заявки:", reply_markup=type_keyboard())
+    elif field == "alcohol":
+        await state.set_state(NewOrder.choosing_alcohol)
+        await callback.message.edit_text("Выбери алкоголь:", reply_markup=alcohol_keyboard(allow_none=True))
+    elif field == "congrats":
+        await state.set_state(NewOrder.entering_congrats)
+        await callback.message.edit_text("Напиши новый текст поздравления:")
+    elif field == "track":
+        await state.set_state(NewOrder.asking_track)
+        await callback.message.edit_text("Нужен трек?", reply_markup=yes_no_keyboard("track"))
+    elif field == "hookah":
+        await state.set_state(NewOrder.asking_hookah)
+        await callback.message.edit_text("Добавить кальян?", reply_markup=yes_no_keyboard("hookah"))
+    elif field == "bigcheck":
+        await state.set_state(NewOrder.asking_big_check)
+        await callback.message.edit_text("Чек гостя 200+?", reply_markup=yes_no_keyboard("bigcheck"))
+    elif field == "note":
+        await state.set_state(NewOrder.entering_note)
+        await callback.message.edit_text("Пришли новое фото или напиши новый комментарий:")
+    await callback.answer()
 
 
 @router.callback_query(NewOrder.confirming, F.data == "confirm:restart")
@@ -777,6 +836,27 @@ def order_summary_line(o: Order) -> str:
     return f"{mark} Стол {o.table} — {kind}{tag_str} — {status_label}"
 
 
+def recommendation_text(chat_state: ChatState) -> str:
+    if chat_state.paused:
+        return "\n⏸ <b>Рекомендация:</b> очередь приостановлена из-за текущего номера."
+    active = chat_state.active_orders()
+    if not active:
+        return "\n💡 <b>Рекомендация:</b> активных заявок нет."
+    ready = [o for o in active if o.status == "ready"]
+    order = ready[0] if ready else active[0]
+    reason = []
+    if order.is_vip_table:
+        reason.append("VIP-стол")
+    if order.big_check:
+        reason.append("чек 200+")
+    if order.order_type == "bday":
+        reason.append("ДР")
+    if order.track:
+        reason.append("нужен трек")
+    why = ", ".join(reason) if reason else "ранняя заявка в очереди"
+    return f"\n⭐ <b>Рекомендуемый следующий вынос:</b> стол {order.table} ({why})."
+
+
 def render_waiter(chat_state: ChatState, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     orders = [o for o in chat_state.active_orders()]
     lines = ["<b>📋 Заявки</b>", ""]
@@ -787,6 +867,7 @@ def render_waiter(chat_state: ChatState, user_id: int) -> tuple[str, InlineKeybo
         lines.append(order_summary_line(o))
         if not o.ready_waiter:
             rows.append([InlineKeyboardButton(text=f"✅ Готов — Стол {o.table}", callback_data=f"ready_w:{o.id}")])
+    lines.append(recommendation_text(chat_state))
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -884,6 +965,7 @@ def render_manager(chat_state: ChatState) -> tuple[str, InlineKeyboardMarkup]:
         lines.append(order_summary_line(o))
         if o.status == "announced":
             rows.append([InlineKeyboardButton(text=f"🏁 Выполнено — Стол {o.table}", callback_data=f"done:{o.id}")])
+    lines.append(recommendation_text(chat_state))
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
