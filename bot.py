@@ -142,6 +142,11 @@ def employee_name(user_id: int) -> str:
     return user_names.get(user_id, "Без имени")
 
 
+def employee_identity(user_id: int) -> str:
+    role = get_role(user_id)
+    return f"{employee_name(user_id)} — {ROLE_LABELS.get(role, 'Сотрудник')}"
+
+
 # ---------------------------------------------------------------------------
 # СОСТОЯНИЕ ЗАЯВОК
 # ---------------------------------------------------------------------------
@@ -160,6 +165,7 @@ class Order:
     track: bool = False
     note_text: Optional[str] = None
     note_photo_id: Optional[str] = None
+    note_voice_id: Optional[str] = None
     hookah: bool = False
     hookah_item: Optional[str] = None
     big_check: bool = False
@@ -255,7 +261,7 @@ bot_instance: Optional[Bot] = None  # используется фоновой з
 
 async def broadcast_to_staff(bot: Bot, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
     """Дублирует важное сообщение всем сотрудникам, вошедшим в бота."""
-    for user_id in list(user_roles):
+    for user_id in set(user_roles) | ADMIN_IDS:
         try:
             await bot.send_message(user_id, text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
         except (TelegramBadRequest, TelegramForbiddenError):
@@ -288,6 +294,7 @@ def role_keyboard(user_id: int) -> ReplyKeyboardMarkup:
         rows.append(["🚻 Отошёл"])
     if role in ("art", "admin"):
         rows.append(["🎬 Программа"])
+        rows.append(["👀 Вся картина"])
     if role:
         rows.append(["💬 Связь с отделами"])
     if role == "admin":
@@ -361,6 +368,8 @@ async def enter_employee_name(message: Message, state: FSMContext) -> None:
         return
     user_names[message.from_user.id] = name[:80]
     role = get_role(message.from_user.id)
+    if role == "admin":
+        user_roles[message.from_user.id] = "admin"
     await state.clear()
     await try_delete(message)
     await message.answer(
@@ -447,6 +456,7 @@ class NewOrder(StatesGroup):
     choosing_hookah_item = State()
     asking_big_check = State()
     asking_note_yn = State()
+    asking_note_mode = State()
     entering_note = State()
     confirming = State()
 
@@ -469,6 +479,13 @@ def yes_no_keyboard(prefix: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="Да", callback_data=f"{prefix}:yes"),
         InlineKeyboardButton(text="Нет", callback_data=f"{prefix}:no"),
+    ]])
+
+
+def note_mode_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🎤 Сказать своими словами", callback_data="note_mode:own_words"),
+        InlineKeyboardButton(text="✍️ Написать комментарий", callback_data="note_mode:text"),
     ]])
 
 
@@ -527,8 +544,10 @@ async def start_new_order(message: Message, state: FSMContext) -> None:
         await message.reply("Заявки подают официанты.")
         return
     await state.clear()
+    await state.update_data(created_by=employee_identity(message.from_user.id))
     await state.set_state(NewOrder.choosing_table)
-    await message.answer("Выбери стол:", reply_markup=tables_keyboard())
+    prompt = await message.answer("Выбери стол:", reply_markup=tables_keyboard())
+    await state.update_data(wizard_message_id=prompt.message_id)
 
 
 @router.message(F.text == "📋 Новая заявка (свой вынос)")
@@ -605,20 +624,34 @@ async def enter_congrats(message: Message, state: FSMContext) -> None:
 async def pick_track(callback: CallbackQuery, state: FSMContext) -> None:
     track = callback.data.split(":", 1)[1] == "yes"
     await state.update_data(track=track)
-    if track:
-        await ask_required_note(callback.message, state, edit=True)
-    else:
-        await go_to_confirm(callback.message, state, edit=True)
+    await ask_required_note(callback.message, state, edit=True)
     await callback.answer()
 
 
 async def ask_required_note(message: Message, state: FSMContext, edit: bool = False) -> None:
-    await state.set_state(NewOrder.entering_note)
-    text = "Пришли фото или текст к заявке — это обязательно при выборе трека."
+    await state.set_state(NewOrder.asking_note_mode)
+    text = "Добавь комментарий к заявке: выбери голосовое сообщение или напиши текст."
     if edit:
-        await message.edit_text(text)
+        await message.edit_text(text, reply_markup=note_mode_keyboard())
     else:
-        await message.answer(text)
+        await message.answer(text, reply_markup=note_mode_keyboard())
+
+
+@router.callback_query(NewOrder.asking_note_mode, F.data.startswith("note_mode:"))
+async def choose_note_mode(callback: CallbackQuery, state: FSMContext) -> None:
+    mode = callback.data.split(":", 1)[1]
+    await state.update_data(note_mode=mode)
+    if mode == "own_words":
+        await state.update_data(note_text="MC говорит поздравление своими словами")
+        data = await state.get_data()
+        if data.get("track"):
+            await ask_hookah(callback.message, state, edit=True)
+        else:
+            await go_to_confirm(callback.message, state, edit=True)
+    else:
+        await state.set_state(NewOrder.entering_note)
+        await callback.message.edit_text("Напиши комментарий одним сообщением:")
+    await callback.answer()
 
 
 async def ask_hookah(message: Message, state: FSMContext, edit: bool = False) -> None:
@@ -681,6 +714,16 @@ async def enter_note_photo(message: Message, state: FSMContext) -> None:
         await go_to_confirm(message, state)
 
 
+@router.message(NewOrder.entering_note, F.voice)
+async def enter_note_voice(message: Message, state: FSMContext) -> None:
+    await state.update_data(note_voice_id=message.voice.file_id)
+    await try_delete(message)
+    if (await state.get_data()).get("track"):
+        await ask_hookah(message, state)
+    else:
+        await go_to_confirm(message, state)
+
+
 @router.message(NewOrder.entering_note)
 async def enter_note_text(message: Message, state: FSMContext) -> None:
     await state.update_data(note_text=message.text.strip())
@@ -695,6 +738,19 @@ async def go_to_confirm(message: Message, state: FSMContext, edit: bool = False)
     await state.set_state(NewOrder.confirming)
     data = await state.get_data()
     summary = build_summary(data)
+    wizard_message_id = data.get("wizard_message_id")
+    if wizard_message_id:
+        try:
+            await message.bot.edit_message_text(
+                summary,
+                chat_id=message.chat.id,
+                message_id=wizard_message_id,
+                reply_markup=confirm_keyboard(),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        except TelegramBadRequest:
+            pass
     if edit:
         await message.edit_text(summary, reply_markup=confirm_keyboard(), parse_mode=ParseMode.HTML)
     else:
@@ -704,6 +760,8 @@ async def go_to_confirm(message: Message, state: FSMContext, edit: bool = False)
 def build_summary(data: dict) -> str:
     lines = ["<b>Проверь заявку:</b>", ""]
     lines.append(f"Стол: {data.get('table')}")
+    if data.get("created_by"):
+        lines.append(f"Подал: {data['created_by']}")
     lines.append(f"Тип: {'ДР' if data.get('order_type') == 'bday' else 'Вынос'}")
     if data.get("alcohol"):
         lines.append(f"Алкоголь: {data['alcohol']}")
@@ -714,6 +772,8 @@ def build_summary(data: dict) -> str:
         lines.append(f"Комментарий: {data['note_text']}")
     if data.get("note_photo_id"):
         lines.append("Фото: приложено")
+    if data.get("note_voice_id"):
+        lines.append("Голосовой комментарий: приложен")
     lines.append(f"Кальян: {'да (вкус выберет кальянщик)' if data.get('hookah') else 'нет'}")
     lines.append(f"Чек 200+: {'да' if data.get('big_check') else 'нет'}")
     return "\n".join(lines)
@@ -784,10 +844,11 @@ async def send_order(callback: CallbackQuery, state: FSMContext) -> None:
         track=data.get("track", False),
         note_text=data.get("note_text"),
         note_photo_id=data.get("note_photo_id"),
+        note_voice_id=data.get("note_voice_id"),
         hookah=data.get("hookah", False),
         hookah_item=data.get("hookah_item"),
         big_check=data.get("big_check", False),
-        waiter_name=employee_name(callback.from_user.id),
+        waiter_name=data.get("created_by", employee_identity(callback.from_user.id)),
     )
 
     await state.clear()
@@ -819,8 +880,10 @@ def hookah_own_confirm_keyboard() -> InlineKeyboardMarkup:
 
 async def start_hookah_own_order(message: Message, state: FSMContext) -> None:
     await state.clear()
+    await state.update_data(created_by=employee_identity(message.from_user.id))
     await state.set_state(HookahOwnOrder.choosing_table)
-    await message.answer("Свой вынос с кальяном. Выбери стол:", reply_markup=tables_keyboard())
+    prompt = await message.answer("Свой вынос с кальяном. Выбери стол:", reply_markup=tables_keyboard())
+    await state.update_data(wizard_message_id=prompt.message_id)
 
 
 @router.callback_query(HookahOwnOrder.choosing_table, F.data.startswith("table:"))
@@ -873,11 +936,26 @@ async def hown_go_to_confirm(message: Message, state: FSMContext, edit: bool = F
     data = await state.get_data()
     lines = ["<b>Проверь заявку:</b>", ""]
     lines.append(f"Стол: {data.get('table')}")
+    if data.get("created_by"):
+        lines.append(f"Подал: {data['created_by']}")
     lines.append(f"Кальян: {data.get('hookah_item')}")
     lines.append(f"Трек: {'да' if data.get('track') else 'нет'}")
     if data.get("announce_text"):
         lines.append(f"Текст для МС: {data['announce_text']}")
     text = "\n".join(lines)
+    wizard_message_id = data.get("wizard_message_id")
+    if wizard_message_id:
+        try:
+            await message.bot.edit_message_text(
+                text,
+                chat_id=message.chat.id,
+                message_id=wizard_message_id,
+                reply_markup=hookah_own_confirm_keyboard(),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        except TelegramBadRequest:
+            pass
     if edit:
         await message.edit_text(text, reply_markup=hookah_own_confirm_keyboard(), parse_mode=ParseMode.HTML)
     else:
@@ -907,7 +985,7 @@ async def hown_send(callback: CallbackQuery, state: FSMContext) -> None:
         announce_text=data.get("announce_text"),
         no_waiter=True,
         dancer=True,
-        hookah_name=employee_name(callback.from_user.id),
+        hookah_name=data.get("created_by", employee_identity(callback.from_user.id)),
     )
 
     await state.clear()
@@ -945,7 +1023,8 @@ def order_summary_line(o: Order) -> str:
         "ready": "🟢 Готово",
         "announced": "🟣 Объявлено",
     }.get(o.status, o.status)
-    return f"{mark} Стол {o.table} — {kind}{tag_str} — {status_label}"
+    author = f" — подал: {o.waiter_name or o.hookah_name}" if (o.waiter_name or o.hookah_name) else ""
+    return f"{mark} Стол {o.table} — {kind}{tag_str} — {status_label}{author}"
 
 
 def recommendation_text(chat_state: ChatState) -> str:
@@ -1154,9 +1233,9 @@ async def btn_manager(message: Message) -> None:
     await show_view(message.bot, message.chat.id, "manager", message.from_user.id)
 
 
-@router.message(F.text == "👀 Всё сразу")
+@router.message(F.text.in_({"👀 Всё сразу", "👀 Вся картина"}))
 async def btn_overview(message: Message) -> None:
-    if not is_admin(message.from_user.id):
+    if not can_manage_program(message.from_user.id):
         return
     await show_view(message.bot, message.chat.id, "manager", message.from_user.id)
 
