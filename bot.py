@@ -296,42 +296,13 @@ async def notify_roles(bot: Bot, roles: set[str], text: str) -> None:
 
 
 def role_keyboard(user_id: int) -> ReplyKeyboardMarkup:
-    role = get_role(user_id)
-    rows: list[list[str]] = []
-
-    if role in ("waiter", "admin"):
-        rows.append(["📋 Новая заявка"])
-        rows.append(["📋 Мои активные заявки"])
-        rows.append(["📋 Общая очередь"])
-    if role in ("hookah", "hookah_chief", "admin"):
-        rows.append(["📋 Новая заявка (свой вынос)"])
-        rows.append(["💨 Заявки на кальян"])
-        rows.append(["📋 Общая очередь"])
-    if role in ("hookah_chief", "admin"):
-        rows.append(["👑 Контроль кальянщиков"])
-    if role in ("mc", "admin"):
-        rows.append(["🎤 Экран MC"])
-        rows.append(["📋 Общая очередь"])
-    if role in ("music", "admin"):
-        rows.append(["🎵 Треки"])
-    if role in ("dancer", "admin"):
-        rows.append(["💃 Мои выносы"])
-    if role in ("mc", "music", "dancer"):
-        rows.append(["🚻 Отошёл"])
-    if role in ("art", "admin"):
-        rows.append(["🎬 Программа"])
-        rows.append(["👀 Вся картина"])
-    if role:
-        rows.append(["💬 Связь с отделами"])
-        rows.append(["💬 Общий чат сотрудников"])
-    if role == "admin":
-        rows.append(["🧑‍💼 Менеджер"])
-        rows.append(["📊 Статистика", "👀 Всё сразу"])
-
-    if not rows:
-        rows = [["ℹ️ Кто я?"]]
-
-    rows.append(["🔄 Сменить роль"])
+    rows = [
+        ["📋 Новая заявка"],
+        ["📋 Мои активные заявки"],
+        ["📋 Общая очередь"],
+        ["💬 Чат официантов"],
+        ["❓ Как пользоваться"],
+    ]
 
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=t) for t in row] for row in rows], resize_keyboard=True)
 
@@ -350,8 +321,69 @@ class CommonChat(StatesGroup):
     entering_message = State()
 
 
+def help_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Как создать заявку", callback_data="help:new_order")],
+        [InlineKeyboardButton(text="📂 Мои заявки", callback_data="help:my_orders")],
+        [InlineKeyboardButton(text="👀 Общая очередь", callback_data="help:queue")],
+        [InlineKeyboardButton(text="💬 Чат официантов", callback_data="help:chat")],
+    ])
+
+
+HELP_TEXT = (
+    "<b>Как пользоваться ботом</b>\n\n"
+    "Выбери нужный раздел на кнопках ниже. В каждом шаге бот сам подсказывает, что делать дальше."
+)
+
+
+@router.message(F.text == "❓ Как пользоваться")
+async def open_help(message: Message) -> None:
+    await message.answer(HELP_TEXT, reply_markup=help_keyboard(), parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("help"))
+async def help_command(message: Message) -> None:
+    await message.answer(HELP_TEXT, reply_markup=help_keyboard(), parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data.startswith("help:"))
+async def help_section(callback: CallbackQuery) -> None:
+    section = callback.data.split(":", 1)[1]
+    texts = {
+        "new_order": (
+            "<b>Как создать заявку</b>\n\n"
+            "1. Нажми «Новая заявка».\n"
+            "2. Выбери стол.\n"
+            "3. Выбери «Вынос» или «ДР».\n"
+            "4. Выбери алкоголь.\n"
+            "5. Ответь, нужен ли трек.\n"
+            "6. Добавь фото или комментарий, если бот попросит.\n"
+            "7. Укажи кальян и чек 200+.\n"
+            "8. Проверь заявку и нажми «Всё верно, отправить»."
+        ),
+        "my_orders": (
+            "<b>Мои активные заявки</b>\n\n"
+            "Здесь находятся заявки, которые подал именно ты.\n"
+            "Статус и готовность заявки обновляются автоматически."
+        ),
+        "queue": (
+            "<b>Общая очередь</b>\n\n"
+            "Здесь видны все активные заявки клуба.\n"
+            "Заявки с VIP-столами, ДР и важными отметками поднимаются выше."
+        ),
+        "chat": (
+            "<b>Чат официантов</b>\n\n"
+            "Напиши сообщение — его получат все официанты, которые уже вошли в бота.\n"
+            "Имя отправителя добавится автоматически."
+        ),
+    }
+    await callback.message.edit_text(texts.get(section, HELP_TEXT), reply_markup=help_keyboard(), parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext) -> None:
+    user_roles[message.from_user.id] = "waiter"
     role = get_role(message.from_user.id)
     if role and employee_name(message.from_user.id) != "Без имени":
         await message.answer(f"Ты вошёл как: {ROLE_LABELS[role]}", reply_markup=role_keyboard(message.from_user.id))
@@ -359,16 +391,14 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         await state.set_state(RolePick.entering_name)
         await message.answer("Напиши своё имя и фамилию — это будет отображаться в заявках:")
     else:
-        await state.set_state(RolePick.entering_code)
-        prompt = await message.answer("Введи код своей роли (его даёт админ):")
-        await state.update_data(prompt_id=prompt.message_id)
+        await state.set_state(RolePick.entering_name)
+        await message.answer("Напиши своё имя и фамилию — они будут отображаться в заявках:")
 
 
 @router.message(F.text == "🔄 Сменить роль")
 async def switch_role(message: Message, state: FSMContext) -> None:
-    await state.set_state(RolePick.entering_code)
-    prompt = await message.answer("Введи код роли, на которую хочешь переключиться:")
-    await state.update_data(prompt_id=prompt.message_id)
+    await state.set_state(RolePick.entering_name)
+    await message.answer("Напиши новое имя и фамилию:")
 
 
 @router.message(RolePick.entering_code)
@@ -404,7 +434,11 @@ async def enter_employee_name(message: Message, state: FSMContext) -> None:
     await state.clear()
     await try_delete(message)
     await message.answer(
-        f"Готово, {name}. Твоя роль: {ROLE_LABELS.get(role, 'сотрудник')}",
+        f"Готово, {name}.\n\n"
+        "Ты вошёл как официант. Я буду подсказывать каждый следующий шаг.\n"
+        "Если появятся вопросы, нажми «❓ Как пользоваться».\n\n"
+        "Начни с кнопки «📋 Новая заявка».\n\n"
+        "Выбери раздел:",
         reply_markup=role_keyboard(message.from_user.id),
     )
 
@@ -455,11 +489,11 @@ async def send_department_message(message: Message, state: FSMContext) -> None:
     await message.answer("Сообщение отправлено.", reply_markup=role_keyboard(message.from_user.id))
 
 
-@router.message(F.text == "💬 Общий чат сотрудников")
+@router.message(F.text.in_({"💬 Чат официантов", "💬 Общий чат сотрудников"}))
 async def open_common_chat(message: Message, state: FSMContext) -> None:
     await state.set_state(CommonChat.entering_message)
     await message.answer(
-        "Напиши сообщение — его получат все сотрудники, которые вошли в бота.\n"
+        "Напиши сообщение — его получат все официанты, которые вошли в бота.\n"
         "Для отмены нажми /start."
     )
 
@@ -475,12 +509,12 @@ async def send_common_chat_message(message: Message, state: FSMContext) -> None:
         if user_id == message.from_user.id:
             continue
         try:
-            await message.bot.send_message(user_id, f"💬 <b>Общий чат</b>\n{sender}:\n{text}", parse_mode=ParseMode.HTML)
+            await message.bot.send_message(user_id, f"💬 <b>Чат официантов</b>\n{sender}:\n{text}", parse_mode=ParseMode.HTML)
         except (TelegramBadRequest, TelegramForbiddenError):
             pass
     await state.clear()
     await try_delete(message)
-    await message.answer("Сообщение отправлено всем сотрудникам.", reply_markup=role_keyboard(message.from_user.id))
+    await message.answer("Сообщение отправлено всем официантам.", reply_markup=role_keyboard(message.from_user.id))
 
 
 @router.message(F.text == "🚻 Отошёл")
@@ -1919,3 +1953,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
