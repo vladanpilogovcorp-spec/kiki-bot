@@ -69,11 +69,13 @@ from aiogram.types import (
 # ---------------------------------------------------------------------------
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "PASTE_YOUR_TOKEN_HERE")
+# ID общего рабочего чата; при значении 0 бот работает только в личных чатах.
 MC_USERNAME = os.environ.get("MC_USERNAME", "MC_username")
 MUSIC_USERNAME = os.environ.get("MUSIC_USERNAME", "Natali_username")
 DJ_USERNAME = os.environ.get("DJ_USERNAME", "dj_username")
 DANCER_USERNAMES = [u.strip() for u in os.environ.get("DANCER_USERNAMES", "dancer1,dancer2").split(",") if u.strip()]
 TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Moscow"))
+WORK_CHAT_ID = int(os.environ.get("WORK_CHAT_ID", "0") or 0)
 
 VIP_TABLES = ["1", "2", "3", "4", "333", "555", "777"]
 REGULAR_TABLES = [
@@ -267,6 +269,16 @@ async def broadcast_to_staff(bot: Bot, text: str, reply_markup: Optional[InlineK
         except (TelegramBadRequest, TelegramForbiddenError):
             logger.info("Не удалось отправить сообщение сотруднику %s", user_id)
 
+
+async def notify_work_chat(bot: Bot, text: str) -> None:
+    """Дублирует важные события в общий рабочий чат, если задан WORK_CHAT_ID."""
+    if not WORK_CHAT_ID:
+        return
+    try:
+        await bot.send_message(WORK_CHAT_ID, text, parse_mode=ParseMode.HTML)
+    except (TelegramBadRequest, TelegramForbiddenError):
+        logger.info("Не удалось отправить уведомление в общий чат")
+
 # ---------------------------------------------------------------------------
 # КЛАВИАТУРА ПОД РОЛЬ
 # ---------------------------------------------------------------------------
@@ -278,14 +290,17 @@ def role_keyboard(user_id: int) -> ReplyKeyboardMarkup:
 
     if role in ("waiter", "admin"):
         rows.append(["📋 Новая заявка"])
-        rows.append(["📋 Просмотреть заявки"])
+        rows.append(["📋 Мои активные заявки"])
+        rows.append(["📋 Общая очередь"])
     if role in ("hookah", "hookah_chief", "admin"):
         rows.append(["📋 Новая заявка (свой вынос)"])
         rows.append(["💨 Заявки на кальян"])
+        rows.append(["📋 Общая очередь"])
     if role in ("hookah_chief", "admin"):
         rows.append(["👑 Контроль кальянщиков"])
     if role in ("mc", "admin"):
         rows.append(["🎤 Экран MC"])
+        rows.append(["📋 Общая очередь"])
     if role in ("music", "admin"):
         rows.append(["🎵 Треки"])
     if role in ("dancer", "admin"):
@@ -482,9 +497,14 @@ def yes_no_keyboard(prefix: str) -> InlineKeyboardMarkup:
     ]])
 
 
-def note_mode_keyboard() -> InlineKeyboardMarkup:
+def note_mode_keyboard(track: bool = False) -> InlineKeyboardMarkup:
+    if not track:
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🎤 Сказать своими словами", callback_data="note_mode:own_words"),
+            InlineKeyboardButton(text="✍️ Написать текст", callback_data="note_mode:text"),
+        ]])
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🎤 Сказать своими словами", callback_data="note_mode:own_words"),
+        InlineKeyboardButton(text="📷 Скинуть фото", callback_data="note_mode:photo"),
         InlineKeyboardButton(text="✍️ Написать комментарий", callback_data="note_mode:text"),
     ]])
 
@@ -630,11 +650,16 @@ async def pick_track(callback: CallbackQuery, state: FSMContext) -> None:
 
 async def ask_required_note(message: Message, state: FSMContext, edit: bool = False) -> None:
     await state.set_state(NewOrder.asking_note_mode)
-    text = "Добавь комментарий к заявке: выбери голосовое сообщение или напиши текст."
-    if edit:
-        await message.edit_text(text, reply_markup=note_mode_keyboard())
+    data = await state.get_data()
+    track = data.get("track", False)
+    if track:
+        text = "Добавь информацию к заявке: выбери фото или напиши комментарий."
     else:
-        await message.answer(text, reply_markup=note_mode_keyboard())
+        text = "Выбери вариант для MC или напиши текст:"
+    if edit:
+        await message.edit_text(text, reply_markup=note_mode_keyboard(track))
+    else:
+        await message.answer(text, reply_markup=note_mode_keyboard(track))
 
 
 @router.callback_query(NewOrder.asking_note_mode, F.data.startswith("note_mode:"))
@@ -648,8 +673,12 @@ async def choose_note_mode(callback: CallbackQuery, state: FSMContext) -> None:
             await ask_hookah(callback.message, state, edit=True)
         else:
             await go_to_confirm(callback.message, state, edit=True)
+        await callback.answer()
+        return
+    await state.set_state(NewOrder.entering_note)
+    if mode == "photo":
+        await callback.message.edit_text("Скинь фото одним сообщением. При желании добавь подпись:")
     else:
-        await state.set_state(NewOrder.entering_note)
         await callback.message.edit_text("Напиши комментарий одним сообщением:")
     await callback.answer()
 
@@ -706,6 +735,10 @@ async def pick_add_note(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(NewOrder.entering_note, F.photo)
 async def enter_note_photo(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    if data.get("note_mode") != "photo":
+        await message.answer("Выбрано добавление комментария. Напиши текстом или вернись и выбери «Скинуть фото».")
+        return
     await state.update_data(note_photo_id=message.photo[-1].file_id, note_text=message.caption)
     await try_delete(message)
     if (await state.get_data()).get("track"):
@@ -716,16 +749,15 @@ async def enter_note_photo(message: Message, state: FSMContext) -> None:
 
 @router.message(NewOrder.entering_note, F.voice)
 async def enter_note_voice(message: Message, state: FSMContext) -> None:
-    await state.update_data(note_voice_id=message.voice.file_id)
-    await try_delete(message)
-    if (await state.get_data()).get("track"):
-        await ask_hookah(message, state)
-    else:
-        await go_to_confirm(message, state)
+    await message.answer("Выбери «Скинуть фото» или «Написать комментарий».")
 
 
 @router.message(NewOrder.entering_note)
 async def enter_note_text(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    if data.get("note_mode") != "text":
+        await message.answer("Выбрано добавление фото. Пришли фото или вернись и выбери «Написать комментарий».")
+        return
     await state.update_data(note_text=message.text.strip())
     await try_delete(message)
     if (await state.get_data()).get("track"):
@@ -853,6 +885,12 @@ async def send_order(callback: CallbackQuery, state: FSMContext) -> None:
 
     await state.clear()
     await callback.message.edit_text(f"✅ Заявка по столу {order.table} отправлена.")
+    await notify_work_chat(
+        callback.bot,
+        f"🆕 <b>Новая заявка — стол {order.table}</b>\n"
+        f"Тип: {'ДР' if order.order_type == 'bday' else 'Вынос'}\n"
+        f"Подал: {order.waiter_name}",
+    )
     await refresh_all_views(callback.bot, chat_id)
     await callback.answer("Отправлено")
 
@@ -990,6 +1028,10 @@ async def hown_send(callback: CallbackQuery, state: FSMContext) -> None:
 
     await state.clear()
     await callback.message.edit_text(f"✅ Свой вынос по столу {order.table} отправлен на подтверждение.")
+    await notify_work_chat(
+        callback.bot,
+        f"🆕 <b>Собственный вынос — стол {order.table}</b>\nПодал: {order.hookah_name}",
+    )
     await refresh_all_views(callback.bot, chat_id)
     await callback.answer("Отправлено")
 
@@ -1199,6 +1241,41 @@ async def refresh_all_views(bot: Bot, chat_id: int) -> None:
 @router.message(F.text == "📋 Просмотреть заявки")
 async def btn_waiter(message: Message) -> None:
     await show_view(message.bot, message.chat.id, "waiter", message.from_user.id)
+
+
+@router.message(F.text == "📋 Мои активные заявки")
+async def btn_my_active_orders(message: Message) -> None:
+    role = get_role(message.from_user.id)
+    view = {
+        "waiter": "waiter",
+        "hookah": "hookah",
+        "hookah_chief": "hookah_chief",
+        "mc": "mc",
+        "music": "music",
+        "dancer": "dancer",
+        "art": "manager",
+        "admin": "manager",
+    }.get(role)
+    if view:
+        await show_view(message.bot, message.chat.id, view, message.from_user.id)
+
+
+@router.message(F.text == "📋 Общая очередь")
+async def btn_general_queue(message: Message) -> None:
+    role = get_role(message.from_user.id)
+    if role in ("art", "admin"):
+        view = "manager"
+    elif role in ("hookah", "hookah_chief"):
+        view = "hookah" if role == "hookah" else "hookah_chief"
+    elif role == "mc":
+        view = "mc"
+    elif role == "music":
+        view = "music"
+    elif role == "dancer":
+        view = "dancer"
+    else:
+        view = "waiter"
+    await show_view(message.bot, message.chat.id, view, message.from_user.id)
 
 
 @router.message(F.text == "💨 Заявки на кальян")
@@ -1479,6 +1556,7 @@ async def on_prog_use_template(callback: CallbackQuery) -> None:
     await show_program_screen(callback.bot, callback.message.chat.id)
     text, _ = render_program(chat_state)
     await broadcast_to_staff(callback.bot, "📢 <b>Шоу-программа обновлена:</b>\n\n" + text)
+    await notify_work_chat(callback.bot, "📢 <b>Шоу-программа обновлена</b>\n\n" + text)
     await callback.answer()
 
 
@@ -1508,6 +1586,7 @@ async def enter_program_lines(message: Message, state: FSMContext) -> None:
     await show_program_screen(message.bot, message.chat.id)
     text, _ = render_program(chat_state)
     await broadcast_to_staff(message.bot, "📢 <b>Шоу-программа обновлена:</b>\n\n" + text)
+    await notify_work_chat(message.bot, "📢 <b>Шоу-программа обновлена</b>\n\n" + text)
 
 
 def render_program(chat_state: ChatState) -> tuple[str, InlineKeyboardMarkup]:
@@ -1581,6 +1660,7 @@ async def on_prog_start(callback: CallbackQuery) -> None:
     await show_program_screen(callback.bot, chat_id)
     text, _ = render_program(chat_state)
     await broadcast_to_staff(callback.bot, "📢 <b>Изменение программы:</b>\n\n" + text)
+    await notify_work_chat(callback.bot, "📢 <b>Изменение программы</b>\n\n" + text)
     await callback.answer("Начали")
 
 
@@ -1601,6 +1681,7 @@ async def on_prog_end(callback: CallbackQuery) -> None:
     await show_program_screen(callback.bot, chat_id)
     text, _ = render_program(chat_state)
     await broadcast_to_staff(callback.bot, "📢 <b>Номер завершён, программа обновлена:</b>\n\n" + text)
+    await notify_work_chat(callback.bot, "📢 <b>Номер завершён, программа обновлена</b>\n\n" + text)
     await callback.answer("Возобновлено")
 
 
@@ -1625,6 +1706,7 @@ async def on_prog_shift(callback: CallbackQuery) -> None:
     await show_program_screen(callback.bot, callback.message.chat.id)
     text, _ = render_program(chat_state)
     await broadcast_to_staff(callback.bot, "📢 <b>Время шоу-программы изменено:</b>\n\n" + text)
+    await notify_work_chat(callback.bot, "📢 <b>Время шоу-программы изменено</b>\n\n" + text)
     await callback.answer(f"Сдвинул на +{minutes} мин ({shifted} номеров)")
 
 
