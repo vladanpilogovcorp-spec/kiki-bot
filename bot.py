@@ -248,13 +248,14 @@ class ChatState:
         return sorted([o for o in self.orders.values() if o.status == status], key=lambda o: o.priority_score())
 
 
+club_state = ChatState()
 chat_states: dict[int, ChatState] = {}
 
 
 def get_state(chat_id: int) -> ChatState:
-    if chat_id not in chat_states:
-        chat_states[chat_id] = ChatState()
-    return chat_states[chat_id]
+    # Один клуб — одна очередь. Личные чаты сотрудников не создают копии заявок.
+    chat_states[chat_id] = club_state
+    return club_state
 
 
 router = Router()
@@ -278,6 +279,16 @@ async def notify_work_chat(bot: Bot, text: str) -> None:
         await bot.send_message(WORK_CHAT_ID, text, parse_mode=ParseMode.HTML)
     except (TelegramBadRequest, TelegramForbiddenError):
         logger.info("Не удалось отправить уведомление в общий чат")
+
+
+async def notify_roles(bot: Bot, roles: set[str], text: str) -> None:
+    """Отправляет рабочее уведомление только указанным подразделениям."""
+    recipients = [uid for uid, role in user_roles.items() if role in roles]
+    for user_id in recipients:
+        try:
+            await bot.send_message(user_id, text, parse_mode=ParseMode.HTML)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            pass
 
 # ---------------------------------------------------------------------------
 # КЛАВИАТУРА ПОД РОЛЬ
@@ -312,6 +323,7 @@ def role_keyboard(user_id: int) -> ReplyKeyboardMarkup:
         rows.append(["👀 Вся картина"])
     if role:
         rows.append(["💬 Связь с отделами"])
+        rows.append(["💬 Общий чат сотрудников"])
     if role == "admin":
         rows.append(["🧑‍💼 Менеджер"])
         rows.append(["📊 Статистика", "👀 Всё сразу"])
@@ -331,6 +343,10 @@ class RolePick(StatesGroup):
 
 class DepartmentChat(StatesGroup):
     choosing_department = State()
+    entering_message = State()
+
+
+class CommonChat(StatesGroup):
     entering_message = State()
 
 
@@ -437,6 +453,34 @@ async def send_department_message(message: Message, state: FSMContext) -> None:
     await state.clear()
     await try_delete(message)
     await message.answer("Сообщение отправлено.", reply_markup=role_keyboard(message.from_user.id))
+
+
+@router.message(F.text == "💬 Общий чат сотрудников")
+async def open_common_chat(message: Message, state: FSMContext) -> None:
+    await state.set_state(CommonChat.entering_message)
+    await message.answer(
+        "Напиши сообщение — его получат все сотрудники, которые вошли в бота.\n"
+        "Для отмены нажми /start."
+    )
+
+
+@router.message(CommonChat.entering_message)
+async def send_common_chat_message(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Сообщение не должно быть пустым. Напиши текст ещё раз:")
+        return
+    sender = employee_identity(message.from_user.id)
+    for user_id in set(user_roles) | ADMIN_IDS:
+        if user_id == message.from_user.id:
+            continue
+        try:
+            await message.bot.send_message(user_id, f"💬 <b>Общий чат</b>\n{sender}:\n{text}", parse_mode=ParseMode.HTML)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            pass
+    await state.clear()
+    await try_delete(message)
+    await message.answer("Сообщение отправлено всем сотрудникам.", reply_markup=role_keyboard(message.from_user.id))
 
 
 @router.message(F.text == "🚻 Отошёл")
@@ -891,6 +935,10 @@ async def send_order(callback: CallbackQuery, state: FSMContext) -> None:
         f"Тип: {'ДР' if order.order_type == 'bday' else 'Вынос'}\n"
         f"Подал: {order.waiter_name}",
     )
+    if order.hookah:
+        await notify_roles(callback.bot, {"hookah", "hookah_chief"}, f"💨 <b>Новая заявка на кальян — стол {order.table}</b>")
+    if order.track:
+        await notify_roles(callback.bot, {"music"}, f"🎵 <b>Нужен трек — стол {order.table}</b>")
     await refresh_all_views(callback.bot, chat_id)
     await callback.answer("Отправлено")
 
@@ -1032,6 +1080,9 @@ async def hown_send(callback: CallbackQuery, state: FSMContext) -> None:
         callback.bot,
         f"🆕 <b>Собственный вынос — стол {order.table}</b>\nПодал: {order.hookah_name}",
     )
+    await notify_roles(callback.bot, {"hookah", "hookah_chief"}, f"💨 <b>Собственный вынос — стол {order.table}</b>")
+    if order.track:
+        await notify_roles(callback.bot, {"music"}, f"🎵 <b>Нужен трек — стол {order.table}</b>")
     await refresh_all_views(callback.bot, chat_id)
     await callback.answer("Отправлено")
 
@@ -1217,7 +1268,7 @@ async def show_view(bot: Bot, chat_id: int, view: str, user_id: int) -> None:
     chat_state = get_state(chat_id)
     text, kb = VIEW_RENDERERS[view](chat_state, user_id)
     msg = await bot.send_message(chat_id, text, reply_markup=kb, parse_mode=ParseMode.HTML)
-    chat_state.view_message_ids[f"{view}:{user_id}"] = msg.message_id
+    chat_state.view_message_ids[f"{chat_id}:{view}:{user_id}"] = msg.message_id
     try:
         await bot.pin_chat_message(chat_id, msg.message_id, disable_notification=True)
     except TelegramBadRequest:
@@ -1227,11 +1278,12 @@ async def show_view(bot: Bot, chat_id: int, view: str, user_id: int) -> None:
 async def refresh_all_views(bot: Bot, chat_id: int) -> None:
     chat_state = get_state(chat_id)
     for key, message_id in list(chat_state.view_message_ids.items()):
-        view, uid_str = key.split(":")
+        view_chat_id, view, uid_str = key.split(":")
+        view_chat_id = int(view_chat_id)
         uid = int(uid_str)
         text, kb = VIEW_RENDERERS[view](chat_state, uid)
         try:
-            await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=kb, parse_mode=ParseMode.HTML)
+            await bot.edit_message_text(text, chat_id=view_chat_id, message_id=message_id, reply_markup=kb, parse_mode=ParseMode.HTML)
         except TelegramBadRequest as e:
             if "message is not modified" in str(e):
                 continue
